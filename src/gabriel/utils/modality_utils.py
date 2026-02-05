@@ -44,7 +44,7 @@ def warn_if_modality_mismatch(
             audio_hits += 1
             continue
         if isinstance(candidate, str):
-            words = re.findall(r"\\b\\w+\\b", candidate)
+            words = re.findall(r"\b\w+\b", candidate)
             text_word_counts.append(len(words))
 
     total = len(sample)

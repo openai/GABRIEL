@@ -70,7 +70,7 @@ The tutorial notebook walks through these ideas step-by-step—from setting up a
 ## Installation
 
 ```bash
-pip install gabriel-openai
+pip install openai-gabriel
 
 # or install directly from GitHub
 pip install \

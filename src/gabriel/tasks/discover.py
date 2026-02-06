@@ -6,7 +6,7 @@ import os
 import re
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -90,7 +90,7 @@ class Discover:
 
     def _persist_result_snapshot(self, result: Dict[str, Any]) -> None:
         payload = {
-            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "results": {k: self._to_serializable(v) for k, v in result.items()},
         }
         out_path = os.path.join(self.cfg.save_dir, "discover_results_snapshot.json")
@@ -445,13 +445,13 @@ class Discover:
                 actual_true = (
                     classify_result[actual_col]
                     .fillna(False)
-                    .infer_objects(copy=False)
+                    .infer_objects()
                     .sum()
                 )
                 inverted_true = (
                     classify_result[inverted_col]
                     .fillna(False)
-                    .infer_objects(copy=False)
+                    .infer_objects()
                     .sum()
                 )
                 total = classify_result[[actual_col, inverted_col]].notna().any(axis=1).sum()

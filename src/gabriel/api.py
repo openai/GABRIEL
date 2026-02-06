@@ -536,6 +536,7 @@ async def ideate(
     save_dir: str,
     file_name: str = "ideation.csv",
     model: str = "gpt-5-mini",
+    scientific_theory: bool = True,
     ranking_model: Optional[str] = None,
     n_ideas: int = 1000,
     n_parallels: int = 650,
@@ -582,6 +583,9 @@ async def ideate(
         CSV name for the consolidated ideation output.
     model, ranking_model:
         Models used for idea generation and ranking (if different).
+    scientific_theory:
+        When ``True`` generate novel scientific theories; when ``False`` generate
+        general-purpose ideas with the same output structure.
     n_ideas:
         Target number of ideas to generate before pruning.
     n_parallels:
@@ -634,6 +638,7 @@ async def ideate(
         save_dir=save_dir,
         file_name=file_name,
         model=model,
+        scientific_theory=scientific_theory,
         ranking_model=ranking_model,
         n_parallels=n_parallels,
         n_ideas=n_ideas,

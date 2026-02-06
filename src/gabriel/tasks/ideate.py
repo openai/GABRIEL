@@ -17,8 +17,8 @@ from gabriel.tasks.deduplicate import Deduplicate, DeduplicateConfig
 from gabriel.tasks.seed import Seed, SeedConfig
 
 
-_DEF_ATTR_LABEL = "major new contribution to literature"
-_DEF_ATTR_DESCRIPTION = (
+_SCI_ATTR_LABEL = "major new contribution to literature"
+_SCI_ATTR_DESCRIPTION = (
     "Measures how original, well-reasoned, and consequential the proposed theory is. "
     "High scores correspond to ideas that introduce novel and creative thought, "
     "but above all are just genuinely superior scientific theory pursuant to the topic. "
@@ -36,9 +36,25 @@ _DEF_ATTR_DESCRIPTION = (
     "Default to low ratings unless you are fully convinced this is truly brilliant work deserving of research and publication."
 )
 
+_GEN_ATTR_LABEL = "overall idea quality"
+_GEN_ATTR_DESCRIPTION = (
+    "Measures how useful, clear, and high-leverage the idea is for the stated topic. "
+    "Reward ideas that are non-trivial in scope, tailored to the specific context described in the topic, explain the mechanism clearly, "
+    "and would be genuinely valuable if executed or tested. "
+    "Favor solutions that fit the situation at hand while remaining adaptable to adjacent settings. "
+    "Prioritize clarity, practicality, and impact over novelty for novelty's sake. "
+    "Penalize tiny scope, vague wording, or ideas that are mostly buzzwords. "
+    "Penalize obfuscation and jargon-heavy writing that hides the core idea. "
+    "A top score requires a concrete, high-quality idea with an explainable path to success and clear evaluation signals."
+)
 
-def _default_attributes() -> Dict[str, str]:
-    return {_DEF_ATTR_LABEL: _DEF_ATTR_DESCRIPTION}
+
+def _default_attributes(scientific_theory: bool) -> Dict[str, str]:
+    return (
+        {_SCI_ATTR_LABEL: _SCI_ATTR_DESCRIPTION}
+        if scientific_theory
+        else {_GEN_ATTR_LABEL: _GEN_ATTR_DESCRIPTION}
+    )
 
 
 @dataclass
@@ -52,7 +68,8 @@ class IdeateConfig:
     n_parallels: int = 650
     n_ideas: int = 1000
     evaluation_mode: str = "recursive_rank"
-    attributes: Dict[str, str] = field(default_factory=_default_attributes)
+    scientific_theory: bool = True
+    attributes: Optional[Dict[str, str]] = None
     rank_attribute: Optional[str] = None
     recursive_fraction: float = 1.0 / 3.0
     recursive_min_remaining: int = 30
@@ -75,6 +92,8 @@ class IdeateConfig:
     deduplicate_ideas: bool = True
 
     def __post_init__(self) -> None:
+        if self.attributes is None:
+            self.attributes = _default_attributes(self.scientific_theory)
         if self.additional_instructions is not None:
             cleaned = str(self.additional_instructions).strip()
             self.additional_instructions = cleaned or None
@@ -84,7 +103,7 @@ class IdeateConfig:
 
 
 class Ideate:
-    """Generate and optionally score frontier scientific theories."""
+    """Generate and optionally score ideas or scientific theories."""
 
     def __init__(
         self,
@@ -274,6 +293,7 @@ class Ideate:
                     topic=topic,
                     additional_instructions=additional_instructions or "",
                     seed=seed_text,
+                    scientific_theory=self.cfg.scientific_theory,
                 )
             )
             identifiers.append(f"idea-{idx:05d}")
@@ -356,19 +376,32 @@ class Ideate:
     def _build_seed_instruction(
         self, topic: str, additional_instructions: Optional[str]
     ) -> str:
-        base_lines = [
-            "Generate concise, specific seed concepts that can anchor frontier scientific theories. ",
-            "Each seed should describe a sharply defined angle, mechanism, dataset, real world phenomena or scenario, expressed in 1-2 specific sentences. ",
-            "Seeds must be mutually unique and grounded in the topic. ",
-            "Do not draft the full theory—provide only the inspirational seed or scenario to explore. ",
-            "Be genuinely novel and creative; think deeply about the topic and provide interesting seeds for frontier work that are clearly distinct from one another ",
-            "and would lead to completely different theories and ideas if fully explored. ",
-            "Again: don't describe a theory, just some details/a domain that would be interesting to pursue a novel theory. ",
-            "For each seed, just give some light nudges towards a research focus, NOT the full theory. ",
-            "Each seed should touch on important, non-trivial specific subdomains for research; avoid niches, fads, etc that don't have real significance in the research field or the real world. ",
-            "Don't obsess with recent events like quantum or DeFi; can be old school too, not necessarily anything to do with current events. ",
-            "Can be anything, old events or more recent, wacky or traditional, as long as interesting research focus related to the topic. Present a broad range of seeds across very different interesting angles."
-        ]
+        if self.cfg.scientific_theory:
+            base_lines = [
+                "Generate concise, specific seed concepts that can anchor frontier scientific theories. ",
+                "Each seed should describe a sharply defined angle, mechanism, dataset, real world phenomena or scenario, expressed in 1-2 specific sentences. ",
+                "Seeds must be mutually unique and grounded in the topic. ",
+                "Do not draft the full theory—provide only the inspirational seed or scenario to explore. ",
+                "Be genuinely novel and creative; think deeply about the topic and provide interesting seeds for frontier work that are clearly distinct from one another ",
+                "and would lead to completely different theories and ideas if fully explored. ",
+                "Again: don't describe a theory, just some details/a domain that would be interesting to pursue a novel theory. ",
+                "For each seed, just give some light nudges towards a research focus, NOT the full theory. ",
+                "Each seed should touch on important, non-trivial specific subdomains for research; avoid niches, fads, etc that don't have real significance in the research field or the real world. ",
+                "Don't obsess with recent events like quantum or DeFi; can be old school too, not necessarily anything to do with current events. ",
+                "Can be anything, old events or more recent, wacky or traditional, as long as interesting research focus related to the topic. Present a broad range of seeds across very different interesting angles.",
+            ]
+        else:
+            base_lines = [
+                "Generate concise, specific seed concepts that can anchor strong, useful ideas. ",
+                "Each seed should describe a sharply defined angle, mechanism, workflow, dataset, or real-world scenario, expressed in 1-2 specific sentences. ",
+                "Seeds must be mutually unique and grounded in the topic. ",
+                "Do not draft the full idea—provide only the inspirational seed or scenario to explore. ",
+                "Favor ideas that are non-trivial in scope and would be valuable if executed. ",
+                "Again: don't describe the full solution, just a clear direction or nucleus to explore. ",
+                "For each seed, give light nudges toward a focus (strategy, product, policy, operational change, research direction, etc.), NOT the full plan. ",
+                "Avoid tiny tweaks or niche fads; aim for significant, practical, and clearly distinct directions. ",
+                "Present a broad range of seeds across very different angles so they would lead to genuinely different ideas if explored fully.",
+            ]
         base_lines.append("Primary topic focus:")
         base_lines.append(topic.strip())
         if additional_instructions:

@@ -1,58 +1,70 @@
-Your task is to use your vast internal knowledge and thorough searching of the frontier and highest quality academic literature to ideate on the following topic:
+Your task is to ideate on the following topic:
 
 BEGIN TOPIC
 {{ topic }}
 END TOPIC
 
-Your goal is novelty and brilliance: you are to fully apply yourself and come up with a truly new and specific theory/hypothesis that pushes the frontier of the field described in the topic.
-Your thinking should be rooted in and inspired by existing literature, but you are to be like a professor and come up with a genuinely novel, important, and interesting theory relevant to the topic.
-Be abundantly creative and novel; be willing to challenge the existing and go in profoundly new directions.
-Leverage your deep interdisciplinary knowledge to potentially leverage ideas/observations from other fields too, if applicable.
+{% if scientific_theory %}
+Your aim is to come up with one truly novel scientific theory that pushes the frontier of the field described in the topic.
+Your goal is novelty and brilliance: come up with a new and specific theory/hypothesis that advances the literature.
+Ground your thinking in existing literature, but be like a professor and deliver a genuinely novel, important, and interesting theory relevant to the topic.
+Be abundantly creative and willing to challenge the existing; go in profoundly new directions if needed.
+Leverage deep interdisciplinary knowledge and borrow ideas or observations from other fields when it improves explanatory power.
 
-Your aim is to embody a high quality researcher: fully explore what is already known/theorized, think very deeply about it all, iterate and be truly creative and new in your thinking, and come to something new and specific.
-Your theory should be a genuine add to the literature relevant to the topic; not just new, but significant, specific, and capturing something important in the real world.
-Don't be afraid to return to the drawing board if your initial theories aren't meeting this high standard.
-Triple check that your theory is actually novel, or at the very least a novel twist/addendum in some important way on a existing theory.
-Be creative and willing to go in different directions: say something truly new, not just simple riffs on existing work.
-A good test is that your final theory has novel and unique testable predictions, that other existing theories wouldn't expect.
-Think deeply about testable predictions if applicable; ensure they are unique and non-trivial, and change tack on the theory if the testable predictions are uninteresting.
-Be new and don't be repetitive; better to be wrong than be uncreative and unambitious.
-The ideal theory is novel, testable with unique predictions, and cleverly gets at something non-trivial and non-niche in the topic and the real world.
+Embodied research quality matters: fully explore what is already known/theorized, think deeply, iterate, and arrive at something new and specific.
+The theory must be a real addition to the literature: not just new, but significant, specific, and capturing something important in the real world.
+Triple check novelty (or at least a novel, important twist on existing theory) and be willing to discard weak drafts.
+Avoid simple riffs and rehashes; be bold and original.
+A good test is that your theory yields unique, non-trivial predictions that other theories would not expect.
+Think deeply about testable predictions; if they are uninteresting, change tack.
+Be new and don't be repetitive; better to be wrong than uncreative or unambitious.
+The ideal theory is novel, testable with unique predictions, and captures a non-trivial, non-niche phenomenon in the topic and the real world.
 Don't just slap old theory onto something new like AI or quantum or DeFi; come up with a new and important idea (the subject/data could be old school, not necessarily anything recent).
-Your theory must actually matter, not tied to some niche or fad or new fangled thing but explain something crucial.
+Your theory must matter and explain something crucial, not a tiny effect or fad.
 
-If possible, invoke empirics in justifying and explaining your novel theory.
-This often means real world data/prior findings/examples in the wild (i.e. not in academic literature), but it can also mean great and realistic hypotheticals/illustrative examples/analogies to explain the theory in a real world and understandable way.
-Your audience is academics well versed in the topic, so don't dumb down.
+If possible, invoke empirics in justifying and explaining your theory.
+This can include real-world data, prior findings, or grounded hypotheticals/analogies that make the mechanism vivid and testable.
+Your audience is academics well versed in the topic, so don't dumb down the ideas, but do ensure clarity and simplicity in your writing.
 Aim for a significant addition to the frontier literature.
-At the same time, while the ideas should be frontier thought, your output writing should be a great read for both experts and a somewhat more casual audience as well (e.g. advanced college students).
-It should capture your advanced, novel ideas and the literature while avoiding unnecessary jargon.
-Don't hide behind a veil of complexity; be honest and clear about your theory and don't overhype.
+At the same time, your writing must be clear and readable to experts and advanced students.
+Avoid unnecessary jargon and never hide behind complexity.
 Be the ultimate scientific communicator: valuable, not patronizing, easy to B.S. test for experts; understandable and learnable for a more casual audience too.
 Lean towards a slightly pithy, academic casual voice; fun to read, easy to understand complex ideas, deep and meaningful yet interpretable and engaging.
 Do NOT be vague. Be clear and use excellent explanatory sentences.
-Use simple, easy to understand, casual language where possible; help the reader easily grasp the mechanisms and practical aspects of your theory.
-Clear, edifying, specific, and easy to follow langauge is key.
+Use simple, easy to understand language where possible; help the reader easily grasp the mechanisms and practical aspects of your theory.
+Clarity is paramount across all sections.
 Save technical complexity for the full thinking section; the earlier snippets should be extremely easy to follow for even a more casual audience.
 The nutshell, abstract, etc need to convey the specific interesting ideas you are getting at for a wider audience to be engaged and understand the point.
+For the testable predictions section, provide concrete, falsifiable predictions that are unique to your theory and actionable for empirical testing.
+{% else %}
+Your aim is to come up with one excellent idea that solves the problems or is useful in the context of the provided topic.
+Prioritize usefulness, clarity, and impact over novelty for novelty's sake.
+The idea must be non-trivial in scope and tailored to the specific situation described in the topic.
+It should be clearly relevant to the context while still being adaptable or scalable to related settings.
+Explain the mechanism and why it would work; avoid tiny tweaks, buzzwords, or vague claims.
+Be concrete and specific about what would be done, why it matters, and how success would be evaluated.
+Use simple, clear language; if a term might be unclear, define it in plain language.
+Clarity is paramount across all sections.
+For the testable predictions section, provide measurable evaluation signals or success criteria that indicate the idea is working in this specific context.
+{% endif %}
 
 Structure your output as follows (include the headings like "In a nutshell:" and the newlines in output):
 BEGIN OUTPUT FORMAT
-Title: [a concise, engaging, high quality, and fun title that captures your theory]
+Title: [a concise, engaging, high quality, and fun title that captures your idea/theory]
 
-In a nutshell: [one pithy, efficient sentence that captures the core thrust of your theory; reading this one sentence should give readers a good sense of the deep idea you are getting at]
+In a nutshell: [one pithy, efficient sentence that captures the core thrust of your idea/theory]
 
-In one paragraph: [a single paragraph, like an abstract, that is concise but more thorough than the nutshell; specific and detailed, NOT vague, reading this alone should be enough to grasp the theory; captures the theory but also might touch on motivation/importance, where the theory is grounded, great examples/analogies that capture its empirical validity, how specifically it could be tested, etc]
+In one paragraph: [a single paragraph, like an abstract, that is concise but more thorough than the nutshell; specific and detailed, NOT vague, reading this alone should be enough to grasp the idea/theory]
 
-Illustrative examples: [in one paragraph, at least one well described example of what your theory looks like in a real world scenario; very clear and specific and vivid to inspire understanding of your theory in action]
+Illustrative examples: [in one paragraph, at least one well described example of what your idea/theory looks like in a real world scenario; very clear and specific and vivid]
 
-Testable predictions: [if applicable, in 1-3 concise paragraphs, outline some clear, testable predictions of your theory; novel predictions of real world phenomena that can be empirically tested and would be expected if your theory is true, but not if your theory is false; give a few novel predictions and be specific and unique to your theory]
+Testable predictions: [if applicable, in 1-3 concise paragraphs, outline clear, testable predictions or evaluation signals; be specific and unique to your idea/theory]
 
-The full thinking: [a thorough research memo, covering the theory, the relevant literature, the motivation, the background/significance, relevant math/data/examples/models, what further specific empirical tests could be run (detail experimental design); a reader should deeply understand the theory, its grounding, its novelty and creativity and potential, and its limitations]
+The full thinking: [a thorough memo, covering the idea/theory, the relevant background or literature, the motivation, the mechanism, relevant data/examples/models, what further specific tests or implementations could be run (detail experimental design or rollout plan); a reader should deeply understand the idea/theory, its grounding, its novelty/quality, and its limitations]
 END OUTPUT FORMAT
 Output nothing but a report in the above format; no prefacing, no text outside of the core report.
 
-Once more, the topic of focus to situate your novel, creative, and significant addition to the literature is:
+Once more, the topic of focus to situate your output is:
 
 BEGIN TOPIC
 {{ topic }}
@@ -67,8 +79,6 @@ BEGIN SEED
 {{ seed }}
 END SEED
 {% endif %}
-
-Think creatively, think new thoughts, go in new directions, think deeply about what is known and what needs to be known, aim for useful and testable discovery; think like a professor.
 
 {% if additional_instructions %}
 The user has provided the following additional instructions, clarifications, or labelled examples (if these provided, rely heavily on them to calibrate your judgment).

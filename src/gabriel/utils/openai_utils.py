@@ -174,6 +174,8 @@ def _get_client(base_url: Optional[str] = None) -> openai.AsyncOpenAI:
 # will contain roughly this many tokens.  This value is used solely for estimating cost
 # and determining how many parallel requests can safely run under the token budget.
 ESTIMATED_OUTPUT_TOKENS_PER_PROMPT = 500
+# Extra input tokens to add per prompt when estimating non-text inputs or web search.
+NON_TEXT_INPUT_TOKEN_BUFFER = 2000
 
 # Conservative headroom when translating observed rate limits into concurrency and limiter budgets.
 # Using less than the reported limit provides a buffer for short spikes and accounting inaccuracies.
@@ -413,6 +415,7 @@ def _estimate_cost(
     *,
     sample_size: int = _ESTIMATION_SAMPLE_SIZE,
     estimated_output_tokens_per_prompt: int = ESTIMATED_OUTPUT_TOKENS_PER_PROMPT,
+    extra_input_tokens_per_prompt: int = 0,
 ) -> Optional[Dict[str, float]]:
     """Estimate input/output tokens and cost for a set of prompts.
 
@@ -436,6 +439,8 @@ def _estimate_cost(
         input_tokens = int(avg_tokens * total_prompts * max(1, n))
     else:
         input_tokens = sum(_approx_tokens(p) for p in prompts) * max(1, n)
+    if extra_input_tokens_per_prompt > 0:
+        input_tokens += extra_input_tokens_per_prompt * total_prompts * max(1, n)
     # Estimate output tokens: when no cutoff is provided we assume a reasonable default
     # number of output tokens per prompt.  This prevents the cost estimate from
     # ballooning for long inputs, which previously assumed the output could be as long
@@ -553,10 +558,12 @@ def _format_throughput_plan(
     ultimate_parallel_cap = (
         max(1, ultimate_parallel_cap) if ultimate_parallel_cap is not None else n_parallels
     )
+    fallback_line = "If running into API or timeout errors, try reducing n_parallels."
 
     if planned_ppm is None or planned_ppm <= 0:
         return [
-            "Expected prompts per minute: unknown (rate-limit data unavailable; running with conservative defaults)."
+            "Expected prompts per minute: unknown (rate-limit data unavailable; running with conservative defaults).",
+            fallback_line,
         ]
     estimated_minutes = math.ceil(remaining_prompts / planned_ppm) if remaining_prompts > 0 else 0
     minimum_minutes = max(1, estimated_minutes)
@@ -583,7 +590,7 @@ def _format_throughput_plan(
     )
     if at_ultimate_parallel_cap:
         lines.append(
-            f"Rate currently limited by n_parallels = {ultimate_parallel_cap}. Increase n_parallels for faster runs, if your machine allows. If running into API / timeout errors, consider reducing n_parallels."
+            f"Rate currently limited by n_parallels = {ultimate_parallel_cap}. Increase n_parallels for faster runs, if your machine allows."
         )
     elif limiter:
         lines.append(
@@ -593,6 +600,7 @@ def _format_throughput_plan(
         lines.append(
             f"Rate currently limited by {rate_label} ({rate_val}). Moving to a higher usage tier can raise these limits and allow faster runs."
         )
+    lines.append(fallback_line)
     return lines
 
 
@@ -600,6 +608,7 @@ def _estimate_dataset_stats(
     prompts: List[str],
     *,
     sample_size: int = _ESTIMATION_SAMPLE_SIZE,
+    extra_input_tokens_per_prompt: int = 0,
 ) -> Dict[str, Any]:
     """Return rough totals for words and tokens without scanning massive datasets.
 
@@ -616,15 +625,18 @@ def _estimate_dataset_stats(
         sample = rng.sample(prompts, sample_size)
         avg_words = sum(len(str(p).split()) for p in sample) / float(sample_size)
         avg_tokens = sum(_approx_tokens(p) for p in sample) / float(sample_size)
+        if extra_input_tokens_per_prompt > 0:
+            avg_tokens += float(extra_input_tokens_per_prompt)
         return {
             "word_count": int(avg_words * total_prompts),
             "token_count": int(avg_tokens * total_prompts),
             "sampled": True,
             "sample_size": sample_size,
         }
+    extra_tokens = extra_input_tokens_per_prompt * total_prompts
     return {
         "word_count": sum(len(str(p).split()) for p in prompts),
-        "token_count": sum(_approx_tokens(p) for p in prompts),
+        "token_count": sum(_approx_tokens(p) for p in prompts) + extra_tokens,
         "sampled": False,
         "sample_size": total_prompts,
     }
@@ -741,6 +753,22 @@ def _infer_modality_from_inputs(
     if len(present) > 1:
         return "mixed"
     return present[0]
+
+
+def _estimate_extra_input_tokens_per_prompt(
+    *,
+    modality: Optional[str],
+    web_search: bool,
+    has_media: bool,
+) -> int:
+    """Return the extra input tokens to add per prompt for non-text inputs."""
+
+    mode = (modality or "").lower()
+    if mode and mode not in {"text", "entity"}:
+        return NON_TEXT_INPUT_TOKEN_BUFFER
+    if web_search or has_media:
+        return NON_TEXT_INPUT_TOKEN_BUFFER
+    return 0
 
 
 
@@ -877,6 +905,7 @@ def _print_usage_overview(
     stats: Optional[Dict[str, Any]] = None,
     sample_size: int = _ESTIMATION_SAMPLE_SIZE,
     estimated_output_tokens_per_prompt: int = ESTIMATED_OUTPUT_TOKENS_PER_PROMPT,
+    extra_input_tokens_per_prompt: int = 0,
     heading: Optional[str] = "OpenAI API usage summary",
     show_prompt_stats: bool = True,
 ) -> None:
@@ -898,7 +927,11 @@ def _print_usage_overview(
         print(web_search_warning)
     if web_search_parallel_note:
         print(web_search_parallel_note)
-    stats = stats or _estimate_dataset_stats(prompts, sample_size=sample_size)
+    stats = stats or _estimate_dataset_stats(
+        prompts,
+        sample_size=sample_size,
+        extra_input_tokens_per_prompt=extra_input_tokens_per_prompt,
+    )
     if show_prompt_stats:
         print(f"Prompts: {len(prompts)}")
         print(f"Approx. input words: {stats.get('word_count', 0):,}")
@@ -3002,11 +3035,26 @@ async def get_all_responses(
         estimated_output_tokens_per_prompt = ESTIMATED_OUTPUT_TOKENS_PER_PROMPT
     if estimated_output_tokens_per_prompt <= 0:
         estimated_output_tokens_per_prompt = ESTIMATED_OUTPUT_TOKENS_PER_PROMPT
-    dataset_stats = _estimate_dataset_stats(prompts)
     inferred_modality = modality or _infer_modality_from_inputs(
         prompt_images,
         prompt_audio,
         prompt_pdfs,
+    )
+    web_search_requested = bool(get_response_kwargs.get("web_search", web_search))
+    has_media_payloads = _has_media_payloads(
+        prompt_images,
+        prompt_audio,
+        prompt_pdfs,
+        identifiers,
+    )
+    extra_input_tokens_per_prompt = _estimate_extra_input_tokens_per_prompt(
+        modality=inferred_modality,
+        web_search=web_search_requested,
+        has_media=has_media_payloads,
+    )
+    dataset_stats = _estimate_dataset_stats(
+        prompts,
+        extra_input_tokens_per_prompt=extra_input_tokens_per_prompt,
     )
     cost_estimate = _estimate_cost(
         prompts,
@@ -3016,6 +3064,7 @@ async def get_all_responses(
         use_batch,
         sample_size=_ESTIMATION_SAMPLE_SIZE,
         estimated_output_tokens_per_prompt=estimated_output_tokens_per_prompt,
+        extra_input_tokens_per_prompt=extra_input_tokens_per_prompt,
     )
     _print_run_banner(
         prompts=prompts,
@@ -3349,7 +3398,11 @@ async def get_all_responses(
         )
     show_example_prompt = bool(print_example_prompt and not quiet)
     prompt_list = [p for p, _ in todo_pairs]
-    todo_stats = _estimate_dataset_stats(prompt_list, sample_size=_ESTIMATION_SAMPLE_SIZE)
+    todo_stats = _estimate_dataset_stats(
+        prompt_list,
+        sample_size=_ESTIMATION_SAMPLE_SIZE,
+        extra_input_tokens_per_prompt=extra_input_tokens_per_prompt,
+    )
     if todo_pairs and not using_custom_response_fn and message_verbose:
         _print_usage_overview(
             prompts=prompt_list,
@@ -3367,6 +3420,7 @@ async def get_all_responses(
             stats=todo_stats,
             sample_size=_ESTIMATION_SAMPLE_SIZE,
             estimated_output_tokens_per_prompt=estimated_output_tokens_per_prompt,
+            extra_input_tokens_per_prompt=extra_input_tokens_per_prompt,
             heading="Run limits",
             show_prompt_stats=False,
         )

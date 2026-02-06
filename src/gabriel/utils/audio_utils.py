@@ -6,6 +6,9 @@ import base64
 from pathlib import Path
 from typing import Dict, Optional
 
+from .logging import get_logger
+
+logger = get_logger(__name__)
 
 def encode_audio(audio_path: str) -> Optional[Dict[str, str]]:
     """Return the audio at ``audio_path`` as a dict suitable for the OpenAI API.
@@ -37,6 +40,6 @@ def encode_audio(audio_path: str) -> Optional[Dict[str, str]]:
             b64 = base64.b64encode(f.read()).decode("utf-8")
         ext = path.suffix.lstrip(".").lower() or "wav"
         return {"data": b64, "format": ext}
-    except Exception:
+    except Exception as exc:
+        logger.warning("Failed to encode audio file %s: %s", audio_path, exc)
         return None
-

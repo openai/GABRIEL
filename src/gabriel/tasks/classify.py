@@ -507,9 +507,10 @@ class Classify:
 
         # aggregate across runs using a minimum frequency threshold
         def _min_freq(s: pd.Series) -> Optional[bool]:
-            if s.notna().sum() == 0:
+            s_bool = s.astype("boolean")
+            if s_bool.notna().sum() == 0:
                 return None
-            true_count = s.fillna(False).infer_objects(copy=False).sum()
+            true_count = int(s_bool.sum(skipna=True))
             prop = true_count / self.cfg.n_runs
             return prop >= self.cfg.min_frequency
 

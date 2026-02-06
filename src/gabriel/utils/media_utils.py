@@ -6,6 +6,9 @@ from typing import Any, Dict, List
 from .image_utils import encode_image
 from .audio_utils import encode_audio
 from .pdf_utils import encode_pdf
+from .logging import get_logger
+
+logger = get_logger(__name__)
 
 
 def load_image_inputs(val: Any) -> List[str]:
@@ -43,6 +46,13 @@ def load_audio_inputs(val: Any) -> List[Dict[str, str]]:
             enc = encode_audio(aud)
             if enc:
                 encoded.append(enc)
+            else:
+                logger.warning(
+                    "Audio encoding failed for %s; the file may be corrupted or unreadable.",
+                    aud,
+                )
+        elif isinstance(aud, str) and not os.path.exists(aud):
+            logger.warning("Audio path not found: %s", aud)
         elif isinstance(aud, dict):
             encoded.append(aud)
     return encoded

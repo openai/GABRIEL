@@ -353,8 +353,8 @@ async def seed(
     deduplicate_sample_seed:
         Random seed used when sampling a deterministic subset after
         deduplication.
-    reasoning_effort, reasoning_summary:
-        Optional OpenAI reasoning controls.
+    reasoning_effort:
+        Optional OpenAI reasoning control.
     max_timeout:
         Optional timeout in seconds for each API call.
     template_path:
@@ -479,8 +479,8 @@ async def classify(
         Basename for saved classification CSVs.
     modality:
         Indicates the content modality for prompt rendering.
-    reasoning_effort, reasoning_summary:
-        Optional OpenAI reasoning controls.
+    reasoning_effort:
+        Optional OpenAI reasoning control.
     search_context_size:
         Context size hint forwarded to the Responses API.
     template_path:
@@ -1122,24 +1122,21 @@ async def paraphrase(
     *,
     instructions: str,
     save_dir: str,
-    revised_column_name: Optional[str] = None,
-    n_revisions: int = 1,
-    file_name: str = "paraphrase_responses.csv",
     model: str = "gpt-5-mini",
-    json_mode: bool = False,
-    web_search: Optional[bool] = None,
-    n_parallels: int = 650,
-    use_dummy: bool = False,
-    reset_files: bool = False,
-    reasoning_effort: Optional[str] = None,
-    reasoning_summary: Optional[str] = None,
     modality: str = "text",
-    search_context_size: str = "medium",
     n_rounds: int = 1,
-    recursive_validation: Optional[bool] = None,
-    n_initial_candidates: int = 1,
-    n_validation_candidates: int = 5,
+    n_runs: int = 1,
+    later_round_run_multiplier: int = 5,
+    revised_column_name: Optional[str] = None,
+    validation_attribute: Optional[Dict[str, str]] = None,
     use_modified_source: bool = False,
+    n_parallels: int = 650,
+    reset_files: bool = False,
+    json_mode: bool = False,
+    reasoning_effort: Optional[str] = None,
+    search_context_size: str = "medium",
+    file_name: str = "paraphrase_responses.csv",
+    use_dummy: bool = False,
     template_path: Optional[str] = None,
     response_fn: Optional[Callable[..., Awaitable[Any]]] = None,
     get_all_responses_fn: Optional[Callable[..., Awaitable[pd.DataFrame]]] = None,
@@ -1161,38 +1158,37 @@ async def paraphrase(
         Guidance describing how the paraphrase should differ from the source.
     save_dir:
         Directory where paraphrase outputs are written.
-    revised_column_name:
-        Optional name for the paraphrased column; defaults to a generated one.
-    n_revisions:
-        Number of paraphrases to produce per passage.
-    file_name:
-        CSV filename for saved paraphrases.
     model:
         Model name used for generation.
-    json_mode:
-        Whether to request JSON responses.
-    web_search:
-        Enable web search augmentation when supported by the model.
     modality:
         Modality of inputs (text, image, audio, pdf, entity, web).
-    search_context_size:
-        Web search context size when ``modality="web"``.
-    n_parallels:
-        Maximum concurrent paraphrase calls.
-    use_dummy:
-        Produce deterministic dummy paraphrases.
-    reset_files:
-        When ``True`` regenerate outputs even if files already exist.
-    reasoning_effort, reasoning_summary:
-        Optional OpenAI reasoning controls.
     n_rounds:
         Maximum number of paraphrase/validation cycles. ``1`` disables recursion.
-    recursive_validation:
-        Deprecated boolean flag retained for compatibility; prefer ``n_rounds``.
-    n_initial_candidates, n_validation_candidates:
-        Control the number of candidates in generation and validation phases.
+    n_runs:
+        Number of paraphrases to produce per passage and per round.
+    later_round_run_multiplier:
+        Multiplier applied to ``n_runs`` for rounds after the first one.
+    revised_column_name:
+        Optional name for the paraphrased column; defaults to a generated one.
+    validation_attribute:
+        Optional custom classifier label definition used to validate candidates; if multiple
+        entries are provided, the first key/value pair is used.
     use_modified_source:
         If ``True`` allow modified source text to be used during validation.
+    n_parallels:
+        Maximum concurrent paraphrase calls.
+    reset_files:
+        When ``True`` regenerate outputs even if files already exist.
+    json_mode:
+        Whether to request JSON responses.
+    reasoning_effort:
+        Optional OpenAI reasoning control.
+    search_context_size:
+        Web search context size when ``modality="web"``.
+    file_name:
+        CSV filename for saved paraphrases.
+    use_dummy:
+        Produce deterministic dummy paraphrases.
     template_path:
         Custom template path to override the default paraphrase prompt.
     response_fn:
@@ -1216,23 +1212,20 @@ async def paraphrase(
     cfg = ParaphraseConfig(
         instructions=instructions,
         revised_column_name=revised_column_name,
-        n_revisions=n_revisions,
+        n_rounds=n_rounds,
+        n_runs=n_runs,
+        later_round_run_multiplier=later_round_run_multiplier,
+        use_modified_source=use_modified_source,
+        validation_attribute=validation_attribute,
         save_dir=save_dir,
         file_name=file_name,
         model=model,
         json_mode=json_mode,
-        web_search=web_search,
+        modality=modality,
         n_parallels=n_parallels,
+        search_context_size=search_context_size,
         use_dummy=use_dummy,
         reasoning_effort=reasoning_effort,
-        reasoning_summary=reasoning_summary,
-        modality=modality,
-        search_context_size=search_context_size,
-        n_rounds=n_rounds,
-        recursive_validation=recursive_validation,
-        n_initial_candidates=n_initial_candidates,
-        n_validation_candidates=n_validation_candidates,
-        use_modified_source=use_modified_source,
         **cfg_kwargs,
     )
     return await Paraphrase(cfg, template_path=template_path).run(

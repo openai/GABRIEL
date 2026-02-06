@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import random
 import re
-import warnings
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -36,10 +35,33 @@ class ParaphraseConfig:
     # Optional name for the revised column in the output DataFrame.  If
     # unspecified, ``f"{column_name}_revised"`` will be used.
     revised_column_name: Optional[str] = None
-    # Number of revisions to generate per passage.  When greater than 1,
-    # additional columns will be appended to the output DataFrame with
-    # suffixes ``_1``, ``_2``, etc.
-    n_revisions: int = 1
+    # Maximum number of paraphrase/validation rounds to run.  A value of
+    # ``1`` preserves the historical behaviour of a single paraphrase
+    # generation pass with no recursive validation.  Values greater than
+    # one enable recursive validation with an upper bound on the number of
+    # cycles.
+    n_rounds: int = 1
+    # Number of paraphrases to generate per passage.  When greater than
+    # 1, additional columns will be appended to the output DataFrame with
+    # suffixes ``_1``, ``_2``, etc.  The same value is also used as the
+    # number of candidates generated in the first validation round.
+    n_runs: int = 1
+    # Multiplier applied to ``n_runs`` for rounds after the first one.  The
+    # multiplier is applied once per round and does not compound with
+    # the round number.
+    later_round_run_multiplier: int = 5
+    # Whether to feed the previously chosen paraphrase back into the
+    # generator during recursive validation.  When ``False`` (the
+    # default), the original text is always used as the source for
+    # regeneration.  When ``True``, the most recent paraphrase is
+    # provided as the input for further rewriting.  This can be useful
+    # when incremental improvements are desired rather than starting
+    # over from the original each time.  The option only has effect
+    # when ``n_rounds`` is greater than one.
+    use_modified_source: bool = False
+    # Optional override for the classifier label used during validation.
+    # If multiple entries are provided, the first is used.
+    validation_attribute: Optional[Dict[str, str]] = None
     # Directory where all paraphrase responses and intermediate files are
     # persisted.
     save_dir: str = "paraphrase"
@@ -69,40 +91,6 @@ class ParaphraseConfig:
     use_dummy: bool = False
     # Optional reasoning effort passed through to the LLM helper.
     reasoning_effort: Optional[str] = None
-    # Optional reasoning summary passed through to the LLM helper.
-    reasoning_summary: Optional[str] = None
-    # Maximum number of paraphrase/validation rounds to run.  A value of
-    # ``1`` preserves the historical behaviour of a single paraphrase
-    # generation pass with no recursive validation.  Values greater than
-    # one enable recursive validation with an upper bound on the number of
-    # cycles.
-    n_rounds: int = 1
-    # Deprecated flag kept for backwards compatibility.  When set to
-    # ``True`` and ``n_rounds`` is left at its default, it will be coerced
-    # to ``2``.
-    recursive_validation: Optional[bool] = None
-    # When greater than one, multiple paraphrases are generated for
-    # each passage in the very first round of generation.  If at least
-    # one candidate passes the validation check, that candidate will be
-    # selected immediately without triggering further rounds.  A value
-    # of one preserves the historical behaviour of producing a single
-    # paraphrase per passage at the outset.
-    n_initial_candidates: int = 1
-    # Number of candidate paraphrases to generate for each failing
-    # passage in subsequent validation rounds.  This value is used
-    # whenever a paraphrase does not initially satisfy the validation
-    # criterion.  Generating multiple candidates in later rounds
-    # improves the probability of finding an acceptable paraphrase.
-    n_validation_candidates: int = 5
-    # Whether to feed the previously chosen paraphrase back into the
-    # generator during recursive validation.  When ``False`` (the
-    # default), the original text is always used as the source for
-    # regeneration.  When ``True``, the most recent paraphrase is
-    # provided as the input for further rewriting.  This can be useful
-    # when incremental improvements are desired rather than starting
-    # over from the original each time.  The option only has effect
-    # when ``recursive_validation`` is enabled.
-    use_modified_source: bool = False
 
     def __post_init__(self) -> None:
         try:
@@ -111,15 +99,6 @@ class ParaphraseConfig:
             rounds = 1
         if rounds < 1:
             rounds = 1
-
-        if self.recursive_validation is not None:
-            warnings.warn(
-                "recursive_validation is deprecated; use n_rounds instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            if self.recursive_validation and rounds <= 1:
-                rounds = 2
 
         self.n_rounds = rounds
 
@@ -151,7 +130,7 @@ class Paraphrase:
         reset_files: bool = False,
         **kwargs: Any,
     ) -> pd.DataFrame:
-        """Paraphrase ``df[column_name]`` and return a DataFrame with revisions.
+        """Paraphrase ``df[column_name]`` and return a DataFrame with runs.
 
         This method orchestrates prompt construction, asynchronous API
         calls, optional recursive validation using the classifier, and
@@ -171,9 +150,9 @@ class Paraphrase:
         # Determine the base name for the revised column(s).
         base_col = self.cfg.revised_column_name or f"{column_name}_revised"
         # Determine how many paraphrases to produce per passage.  A value
-        # less than 1 defaults to a single revision to align with
-        # existing behaviour.
-        n = self.cfg.n_revisions if self.cfg.n_revisions and self.cfg.n_revisions > 0 else 1
+        # less than 1 defaults to a single run to align with existing
+        # behaviour.
+        n = self.cfg.n_runs if self.cfg.n_runs and self.cfg.n_runs > 0 else 1
 
         announce_prompt_rendering("Paraphrase", len(texts) * n)
 
@@ -188,14 +167,14 @@ class Paraphrase:
         if max_rounds < 1:
             max_rounds = 1
 
-        # Track whether each revision ultimately received validation
+        # Track whether each run ultimately received validation
         # approval.  In the non-recursive case every output is treated as
         # approved.
         approval_map: Dict[Tuple[int, int], bool] = {}
 
         # When recursive validation is disabled (or limited to a single
         # round), follow the original behaviour: generate a single
-        # paraphrase per requested revision and skip classification.
+        # paraphrase per requested run and skip classification.
         # Otherwise, defer generation and validation to the recursive
         # routine.
         if max_rounds <= 1:
@@ -267,7 +246,6 @@ class Paraphrase:
                 use_dummy=self.cfg.use_dummy,
                 reset_files=reset_files,
                 reasoning_effort=self.cfg.reasoning_effort,
-                reasoning_summary=self.cfg.reasoning_summary,
                 **kwargs,
             )
             resp_map: Dict[Tuple[int, int], str] = {}
@@ -282,7 +260,7 @@ class Paraphrase:
         else:
             # Initialise an empty response map.  The recursive validation
             # routine will populate this map with one paraphrase per
-            # (row, revision) key and record whether it passed
+            # (row, run) key and record whether it passed
             # validation.
             resp_map: Dict[Tuple[int, int], str] = {}
             await self._recursive_validate(
@@ -294,8 +272,8 @@ class Paraphrase:
                 max_rounds=max_rounds,
             )
 
-        # Assemble the final columns.  When multiple revisions are
-        # requested, each revision will occupy its own column with a
+        # Assemble the final columns.  When multiple runs are requested,
+        # each run will occupy its own column with a
         # numeric suffix.
         col_names = [base_col] if n == 1 else [f"{base_col}_{i}" for i in range(1, n + 1)]
         approval_cols = (
@@ -333,8 +311,8 @@ class Paraphrase:
         Generate and validate paraphrases for each passage using a
         classifier.  This routine unifies initial and subsequent
         candidate generation by allowing a configurable number of
-        candidates on the first round (``n_initial_candidates``) and a
-        separate number for later rounds (``n_validation_candidates``).
+        candidates on the first round (``n_runs``) and a separate
+        multiplier for later rounds (``later_round_run_multiplier``).
         Candidates that pass validation are accepted immediately.  For
         candidates that fail, further paraphrases are generated until
         either a valid paraphrase is found or no new paraphrases can
@@ -347,12 +325,12 @@ class Paraphrase:
         candidate against the original text to ensure the original
         instruction has been followed.
         """
-        # Determine the number of revisions (columns) to produce.  At
-        # least one revision is always generated.  This mirrors the logic
-        # in :meth:`run`.
-        n_revs = self.cfg.n_revisions if self.cfg.n_revisions and self.cfg.n_revisions > 0 else 1
-        # Build a list of keys for every passage/revision pair.  Keys
-        # encode the row index and zero-based revision index.
+        # Determine the number of runs (columns) to produce.  At least
+        # one run is always generated.  This mirrors the logic in
+        # :meth:`run`.
+        n_revs = self.cfg.n_runs if self.cfg.n_runs and self.cfg.n_runs > 0 else 1
+        # Build a list of keys for every passage/run pair.  Keys
+        # encode the row index and zero-based run index.
         all_keys: List[Tuple[int, int]] = [
             (row_idx, rev_idx)
             for row_idx in range(len(original_texts))
@@ -370,18 +348,22 @@ class Paraphrase:
         validation_dir = os.path.join(self.cfg.save_dir, "validation")
         os.makedirs(validation_dir, exist_ok=True)
         # A single label is used to indicate whether the instructions
-        # were followed.  The definition is intentionally phrased in a
-        # slightly more permissive way than before to reduce the false
-        # rejection rate.
-        labels = {
-            "instructions_followed": (
-                "Return True if the instructions were largely (even if not perfectly) followed in turning the "
-                "original text into the modified text (i.e. the modified text mostly exhibits the spirit of the instructions "
-                "even if not everything is exact). Be quite forgiving; understand that the modifications won't be perfect. "
-                "Ensure the spirit of the instructions is followed, even if not word for word. "
-                "False otherwise, if there are still important shortcomings in the modified text vis a vis the instructions."
-            )
-        }
+        # were followed.  Users may override the label definition by
+        # supplying ``validation_attribute``; if multiple entries are
+        # provided, the first one is used.
+        if self.cfg.validation_attribute:
+            label_key, label_desc = next(iter(self.cfg.validation_attribute.items()))
+            labels = {label_key: label_desc}
+        else:
+            label_key = "instructions_followed"
+            labels = {
+                label_key: (
+                    "Return True if the modified text faithfully and thoroughly applies the spirit of the instructions "
+                    "to the original text. Allow for minor imperfections, but ensure the core requirements are satisfied "
+                    "and the transformation is meaningfully aligned with the intent. "
+                    "Return False if key requirements are missing, contradicted, or only weakly addressed."
+                )
+            }
         classify_cfg = ClassifyConfig(
             labels=labels,
             save_dir=validation_dir,
@@ -390,7 +372,6 @@ class Paraphrase:
             n_runs=1,
             use_dummy=self.cfg.use_dummy,
             reasoning_effort=self.cfg.reasoning_effort,
-            reasoning_summary=self.cfg.reasoning_summary,
         )
         classifier = Classify(classify_cfg)
 
@@ -399,13 +380,15 @@ class Paraphrase:
         last_candidate_map: Dict[Tuple[int, int], List[str]] = {}
         while to_check and round_number < max_rounds:
             # Determine how many candidate paraphrases to generate per
-            # passage for this round.  The first round uses
-            # ``n_initial_candidates``; later rounds use
-            # ``n_validation_candidates``.
+            # passage for this round.  The first round uses ``n_runs``;
+            # later rounds use ``later_round_run_multiplier``.
             if round_number == 0:
-                candidates_per_key = max(self.cfg.n_initial_candidates, 1)
+                candidates_per_key = max(self.cfg.n_runs, 1)
             else:
-                candidates_per_key = max(self.cfg.n_validation_candidates * round_number, 1)
+                candidates_per_key = max(
+                    self.cfg.n_runs * self.cfg.later_round_run_multiplier,
+                    1,
+                )
 
             # Build paraphrase prompts for every key still requiring
             # validation.  Each key may produce multiple candidates.
@@ -442,9 +425,9 @@ class Paraphrase:
                             json_mode=self.cfg.json_mode,
                         )
                     )
-                    # Encode row, revision, round and candidate index in
-                    # the identifier.  Revision numbers are stored one-
-                    # based in the identifier for backwards compatibility.
+                    # Encode row, run, round and candidate index in
+                    # the identifier.  Run numbers are stored one-based
+                    # in the identifier for backwards compatibility.
                     identifiers.append(
                         f"row_{row_idx}_rev{rev_idx + 1}_round{round_number}_cand{cand_idx}"
                     )
@@ -523,10 +506,9 @@ class Paraphrase:
                 use_dummy=self.cfg.use_dummy,
                 reset_files=reset_files,
                 reasoning_effort=self.cfg.reasoning_effort,
-                reasoning_summary=self.cfg.reasoning_summary,
             )
 
-            # Organise API responses by (row, revision) so that
+            # Organise API responses by (row, run) so that
             # classification can be performed in bulk.  Each key
             # corresponds to a list of candidate paraphrases.
             candidate_map: Dict[Tuple[int, int], List[str]] = {
@@ -534,7 +516,7 @@ class Paraphrase:
             }
             for ident, resp in zip(new_resp_df["Identifier"], new_resp_df["Response"]):
                 text = resp[0] if isinstance(resp, list) and resp else resp
-                # Parse the identifier back into row and revision indices.
+                # Parse the identifier back into row and run indices.
                 m = re.match(r"row_(\d+)_rev(\d+)_round\d+_cand(\d+)", ident)
                 if m:
                     row_i = int(m.group(1))
@@ -544,7 +526,7 @@ class Paraphrase:
             last_candidate_map = candidate_map
 
             # Build classification prompts for every candidate across all
-            # keys.  We keep a parallel list of (row, revision, candidate
+            # keys.  We keep a parallel list of (row, run, candidate
             # index) so we can map results back after classification.
             cand_prompts: List[str] = []
             cand_keys: List[Tuple[int, int, int]] = []
@@ -585,7 +567,7 @@ class Paraphrase:
             else:
                 cand_res_df = pd.DataFrame()
 
-            # Build a lookup from (row, revision) to a list of boolean
+            # Build a lookup from (row, run) to a list of boolean
             # classification results corresponding to each candidate.  A
             # candidate passes if the classifier returns True or None.  A
             # None value indicates uncertainty but is treated as a pass
@@ -595,7 +577,7 @@ class Paraphrase:
             }
             for idx, (row_idx, rev_idx, cand_index) in enumerate(cand_keys):
                 if not cand_res_df.empty:
-                    flag = cand_res_df.loc[idx, "instructions_followed"]
+                    flag = cand_res_df.loc[idx, label_key]
                 else:
                     flag = None
                 # Treat None (uncertain) as a pass and only count False

@@ -1576,7 +1576,7 @@ def test_paraphrase_api(tmp_path):
             instructions="reword",
             save_dir=str(tmp_path / "para_multi"),
             use_dummy=True,
-            n_revisions=2,
+            n_runs=2,
         )
     )
     assert "txt_revised_1" in df_multi.columns and "txt_revised_2" in df_multi.columns

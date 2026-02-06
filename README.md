@@ -76,9 +76,11 @@ pip install openai-gabriel
 pip install \
   --force-reinstall \
   git+https://github.com/openai/GABRIEL.git@main
+
+# then run import gabriel
 ```
 
-Before running real jobs, point the helpers to your GPT endpoint:
+Before running a GABRIEL call, declare your GPT API key:
 
 ```bash
 export OPENAI_API_KEY="sk-..."

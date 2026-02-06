@@ -95,6 +95,26 @@ def _parse_json(txt: Any) -> Union[dict, list]:
                     except Exception:
                         pass
 
+    start_brace = cleaned.find("{")
+    end_brace = cleaned.rfind("}")
+    if start_brace != -1 and end_brace != -1 and end_brace > start_brace:
+        try:
+            out = json.loads(cleaned[start_brace : end_brace + 1])
+            if isinstance(out, (dict, list)):
+                return out
+        except Exception:
+            pass
+
+    start_bracket = cleaned.find("[")
+    end_bracket = cleaned.rfind("]")
+    if start_bracket != -1 and end_bracket != -1 and end_bracket > start_bracket:
+        try:
+            out = json.loads(cleaned[start_bracket : end_bracket + 1])
+            if isinstance(out, (dict, list)):
+                return out
+        except Exception:
+            pass
+
     raise ValueError(f"Failed to parse JSON: {cleaned[:200]}")
 
 
@@ -109,6 +129,15 @@ def safe_json(txt: Any) -> Union[dict, list]:
         return _parse_json(txt)
     except Exception:
         return {}
+
+
+def parse_json_with_status(txt: Any) -> Tuple[Optional[Union[dict, list]], bool]:
+    """Parse JSON and report success separately from the parsed value."""
+
+    try:
+        return _parse_json(txt), True
+    except Exception:
+        return None, False
 
 
 async def safest_json(

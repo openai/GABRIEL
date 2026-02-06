@@ -332,21 +332,29 @@ def _detect_modality(
     save_name: str,
 ) -> str:
     detected: Set[str] = set()
+    media_detected: Set[str] = set()
+    saw_text = False
     for file_path in _iter_candidate_files(folder_path, extset, save_name):
         ext = os.path.splitext(file_path)[1].lower()
         if ext in PDF_EXTENSIONS:
             detected.add("pdf")
+            media_detected.add("pdf")
         elif ext in IMAGE_EXTENSIONS:
             detected.add("image")
+            media_detected.add("image")
         elif ext in AUDIO_EXTENSIONS:
             detected.add("audio")
+            media_detected.add("audio")
         else:
             detected.add("text")
-        if "text" in detected:
-            break
+            saw_text = True
     if not detected:
         return "text"
-    if "text" in detected:
+    if media_detected:
+        if len(media_detected) == 1:
+            return next(iter(media_detected))
+        return "text"
+    if saw_text or "text" in detected:
         return "text"
     if len(detected) == 1:
         return detected.pop()

@@ -117,7 +117,7 @@ except Exception:
     InvalidRequestError = Exception  # type: ignore
     RateLimitError = Exception  # type: ignore
 
-from gabriel.utils.parsing import safe_json
+from gabriel.utils.parsing import parse_json_with_status, safe_json
 
 # single connection pool per process, keyed by base URL and created lazily
 _clients_async: Dict[Optional[str], openai.AsyncOpenAI] = {}
@@ -231,6 +231,14 @@ class BackgroundTimeoutError(asyncio.TimeoutError):
         self.last_response = last_response
 
 
+class JSONParseError(ValueError):
+    """Raised when JSON parsing fails during JSON-mode requests."""
+
+    def __init__(self, message: str, snippet: Optional[str] = None):
+        super().__init__(message)
+        self.snippet = snippet
+
+
 def _extract_retry_after_seconds(error: Exception) -> Optional[float]:
     """Return a retry-after duration in seconds when available."""
 
@@ -335,6 +343,18 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
     "gpt-4o-mini": {"input": 0.15, "cached_input": 0.075, "output": 0.60, "batch": 0.5},
     "o3": {"input": 2.00, "cached_input": 0.50, "output": 8.00, "batch": 0.5},
     "o4-mini": {"input": 1.10, "cached_input": 0.275, "output": 4.40, "batch": 0.5},
+    "gpt-audio-mini": {
+        "input": 0.60,
+        "cached_input": 0.15,
+        "output": 2.40,
+        "batch": 0.5,
+    },
+    "gpt-audio": {
+        "input": 2.50,
+        "cached_input": 0.625,
+        "output": 10.00,
+        "batch": 0.5,
+    },
     "gpt-5.2": {"input": 1.75, "cached_input": 0.175, "output": 14.00, "batch": 0.5},
     "gpt-5.1": {"input": 1.25, "cached_input": 0.125, "output": 10.00, "batch": 0.5},
     "gpt-5": {"input": 1.25, "cached_input": 0.125, "output": 10.00, "batch": 0.5},
@@ -391,6 +411,17 @@ def _print_tier_explainer(verbose: bool = True) -> None:
 def _approx_tokens(text: str) -> int:
     """Roughly estimate the token count from a string by assuming ~1.5 tokens per word."""
     return int(len(str(text).split()) * 1.5)
+
+
+def _decide_default_max_output_tokens(
+    max_output_tokens: Optional[int],
+    rate_headers: Optional[Dict[str, str]],
+) -> Optional[int]:
+    """Choose a default max output token cap when the user leaves it unset."""
+
+    if max_output_tokens is not None:
+        return max_output_tokens
+    return None
 
 
 def _lookup_model_pricing(model: str) -> Optional[Dict[str, float]]:
@@ -519,6 +550,26 @@ def _planned_ppm_and_details(
     if throughput is None or throughput <= 0:
         return None, details
     return max(1, int(round(throughput))), details
+
+
+def _safe_planned_ppm_and_details(
+    allowed_req_pm: Optional[float],
+    allowed_tok_pm: Optional[float],
+    tokens_per_call: Optional[float],
+    *,
+    context: str,
+) -> Tuple[Optional[int], Dict[str, float]]:
+    """Wrapper around `_planned_ppm_and_details` that never raises."""
+
+    try:
+        return _planned_ppm_and_details(
+            allowed_req_pm, allowed_tok_pm, tokens_per_call
+        )
+    except Exception as exc:
+        logger.error("Error while %s: %s", context, exc)
+        if context == "tuning concurrency":
+            print(f"Error while updating concurrency cap dynamically: {exc}")
+        return None, {}
 
 
 def _resolve_limiting_factor(
@@ -682,6 +733,7 @@ def _print_run_banner(
     n: int,
     use_batch: bool,
     modality: Optional[str],
+    web_search: bool,
     estimated_cost: Optional[Dict[str, float]],
     max_output_tokens: Optional[int],
     stats: Dict[str, Any],
@@ -730,6 +782,10 @@ def _print_run_banner(
             f"Estimated {'batch' if use_batch else 'synchronous'} cost: ${estimated_cost['total_cost']:.2f} "
             f"(input: ${estimated_cost['input_cost']:.2f}, output: ${estimated_cost['output_cost']:.2f})"
         )
+        if _is_multimodal_estimate(modality=modality, web_search=web_search):
+            print(
+                "Note: multimedia/web inputs can make cost estimates unreliable. Monitor usage in the OpenAI dashboard."
+            )
     else:
         if pricing:
             print("Estimated token usage unavailable for this model.")
@@ -769,6 +825,22 @@ def _estimate_extra_input_tokens_per_prompt(
     if web_search or has_media:
         return NON_TEXT_INPUT_TOKEN_BUFFER
     return 0
+
+
+def _is_multimodal_estimate(
+    *,
+    modality: Optional[str],
+    web_search: bool,
+    has_media: bool = False,
+) -> bool:
+    mode = (modality or "").lower()
+    if web_search:
+        return True
+    if mode and mode not in {"text", "entity"}:
+        return True
+    if has_media:
+        return True
+    return False
 
 
 
@@ -3072,6 +3144,7 @@ async def get_all_responses(
         n=n,
         use_batch=use_batch,
         modality=inferred_modality,
+        web_search=web_search_requested,
         estimated_cost=cost_estimate,
         max_output_tokens=max_output_tokens,
         stats=dataset_stats,
@@ -3580,10 +3653,11 @@ async def get_all_responses(
         # handled by the batch API submission.
         allowed_req_pm = 1
         allowed_tok_pm = 1
-    planned_ppm, throughput_details_plan = _planned_ppm_and_details(
+    planned_ppm, throughput_details_plan = _safe_planned_ppm_and_details(
         allowed_req_pm if manage_rate_limits else None,
         allowed_tok_pm if manage_rate_limits else None,
         estimated_tokens_per_call,
+        context="planning parallelization",
     )
     throughput_ceiling_ppm = (
         max_parallel_ceiling if planned_ppm is None else planned_ppm
@@ -4198,10 +4272,11 @@ async def get_all_responses(
             (estimated_input_tokens_per_prompt + estimated_output_tokens) * max(1, n),
         )
         current_tokens_per_call = estimated_tokens_per_call
-        planned_ppm_live, _ = _planned_ppm_and_details(
+        planned_ppm_live, _ = _safe_planned_ppm_and_details(
             allowed_req_pm if manage_rate_limits else None,
             allowed_tok_pm if manage_rate_limits else None,
             current_tokens_per_call,
+            context="updating token estimates",
         )
         if planned_ppm_live is not None:
             throughput_ceiling_ppm = planned_ppm_live
@@ -4369,10 +4444,11 @@ async def get_all_responses(
             return
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         reason_clean = reason.rstrip(" .:;")
-        planned_ppm, throughput_details = _planned_ppm_and_details(
+        planned_ppm, throughput_details = _safe_planned_ppm_and_details(
             allowed_req_pm if manage_rate_limits else None,
             allowed_tok_pm if manage_rate_limits else None,
             current_tokens_per_call,
+            context="reporting parallelization status",
         )
         timeout_text = ""
         total_completed = processed
@@ -4448,10 +4524,11 @@ async def get_all_responses(
         )
         estimated_tokens_per_call = updated_tokens_per_call
         current_tokens_per_call = updated_tokens_per_call
-        planned_ppm_live, _ = _planned_ppm_and_details(
+        planned_ppm_live, _ = _safe_planned_ppm_and_details(
             allowed_req_pm if manage_rate_limits else None,
             allowed_tok_pm if manage_rate_limits else None,
             current_tokens_per_call,
+            context="refreshing token estimates",
         )
         if planned_ppm_live is not None:
             throughput_ceiling_ppm = planned_ppm_live
@@ -4485,6 +4562,15 @@ async def get_all_responses(
         ]
         if cost_line:
             msg_lines.append("[token estimate] " + cost_line)
+            if _is_multimodal_estimate(
+                modality=inferred_modality,
+                web_search=web_search_requested,
+                has_media=has_media_payloads,
+            ):
+                msg_lines.append(
+                    "[token estimate] Note: multimedia/web inputs can make cost estimates unreliable. "
+                    "Monitor usage in the OpenAI dashboard."
+                )
             if planned_ppm_live is not None and planned_ppm_live > 0:
                 remaining_prompts = max(0, status.num_tasks_started - processed)
                 estimated_minutes = math.ceil(remaining_prompts / planned_ppm_live)
@@ -4863,10 +4949,11 @@ async def get_all_responses(
                             avg_in + max(estimated_output_tokens, observed_output)
                         ) * max(1, n)
                         current_tokens_per_call = max(1.0, tokens_per_call_est)
-                        planned_ppm_live, _ = _planned_ppm_and_details(
+                        planned_ppm_live, _ = _safe_planned_ppm_and_details(
                             allowed_req_pm if manage_rate_limits else None,
                             allowed_tok_pm if manage_rate_limits else None,
                             current_tokens_per_call,
+                            context="tuning concurrency",
                         )
                         if planned_ppm_live is not None:
                             throughput_ceiling_ppm = planned_ppm_live
@@ -5011,6 +5098,22 @@ async def get_all_responses(
                             error_logs.pop(ident, None)
                             await flush()
                         continue
+                json_mode_active = bool(get_response_kwargs.get("json_mode", False))
+                should_validate_json = (
+                    json_mode_active and not use_dummy and not using_custom_response_fn
+                )
+                if should_validate_json:
+                    invalid_payloads = []
+                    for resp in _coerce_to_list(resps):
+                        _, ok = parse_json_with_status(resp)
+                        if not ok:
+                            invalid_payloads.append(resp)
+                    if invalid_payloads:
+                        snippet = str(invalid_payloads[0])[:200]
+                        raise JSONParseError(
+                            f"JSON parsing failed for identifier {ident}.",
+                            snippet=snippet,
+                        )
                 row = {
                     "Identifier": ident,
                     "Response": resps,
@@ -5172,6 +5275,48 @@ async def get_all_responses(
                         error_logs.pop(ident, None)
                         _maybe_trigger_threshold_refresh()
                         await flush()
+            except JSONParseError as e:
+                inflight.pop(ident, None)
+                status.num_other_errors += 1
+                error_detail = str(e).strip()
+                if e.snippet:
+                    error_detail = f"{error_detail} Snippet: {e.snippet}"
+                logger.warning(f"JSON parse error for {ident}: {error_detail}")
+                _emit_first_error(
+                    f"JSON parse error encountered: {error_detail}",
+                    dedup_key=("json-parse-error", error_detail),
+                )
+                error_logs[ident].append(error_detail)
+                if attempts_left - 1 > 0:
+                    backoff = random.uniform(1, 2) * (2 ** (max_retries - attempts_left))
+                    await _maybe_retry(backoff)
+                else:
+                    row = {
+                        "Identifier": ident,
+                        "Response": None,
+                        "Web Search Sources": sources_data,
+                        "Time Taken": duration,
+                        "Input Tokens": total_input,
+                        "Reasoning Tokens": total_reasoning,
+                        "Output Tokens": total_output,
+                        "Reasoning Effort": get_response_kwargs.get(
+                            "reasoning_effort", reasoning_effort
+                        ),
+                        "Successful": False,
+                        "Error Log": error_logs.get(ident, []),
+                    }
+                    if response_ids:
+                        row["Response IDs"] = response_ids
+                    if reasoning_summary is not None:
+                        row["Reasoning Summary"] = None
+                    results.append(row)
+                    processed += 1
+                    status.num_tasks_failed += 1
+                    status.num_tasks_in_progress -= 1
+                    pbar.update(1)
+                    error_logs.pop(ident, None)
+                    _maybe_trigger_threshold_refresh()
+                    await flush()
             except RateLimitError as e:
                 inflight.pop(ident, None)
                 status.num_rate_limit_errors += 1

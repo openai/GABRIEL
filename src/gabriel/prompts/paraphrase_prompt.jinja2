@@ -8,17 +8,15 @@ BEGIN INSTRUCTIONS
 END INSTRUCTIONS
 
 Modality guidance:
-- text: paraphrase the full passage, preserving meaning and key details while applying the instructions.
-- entity: rewrite the entity name in a consistent way per the instructions.
-- web: paraphrase/consolidate the web content found for the search term per the instructions.
-- image/audio/pdf: paraphrase the observed content into text in accordance with the instructions.
+- text: paraphrase/consolidate/modify the text in accordance with the instructions
+- entity: rewrite the entity name in a consistent way per the instructions
+- web: paraphrase/consolidate the web content found for the search term per the instructions
+- image/audio/pdf: paraphrase/summarize the observed content into text per instructions
 
-Output format (template):
 {% if json_mode %}
 Always output JSON only in the indicated format.
-{"revised_text": "<revised_text>"}
 {% else %}
-<revised_text>
+Always output plain text only.
 {% endif %}
 
 No preamble, no explanation, only the desired revised text alone, faithful to the provided content and in accordance with the instructions.

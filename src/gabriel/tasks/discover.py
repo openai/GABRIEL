@@ -211,6 +211,7 @@ class Discover:
                 categories=None,
                 additional_instructions=self.cfg.additional_instructions or "",
                 reset_files=reset_files,
+                **kwargs,
             )
             term_defs: Dict[str, str] = {}
             if "coded_passages" in codify_df:
@@ -249,6 +250,7 @@ class Discover:
                 circle_column_name,  # type: ignore[arg-type]
                 square_column_name,  # type: ignore[arg-type]
                 reset_files=reset_files,
+                **kwargs,
             )
             term_defs = {}
             for attr, expl in zip(
@@ -293,6 +295,7 @@ class Discover:
                 candidate_df,
                 "term",
                 reset_files=reset_files,
+                **kwargs,
             )
 
         labels = (
@@ -390,6 +393,7 @@ class Discover:
                 circle_column_name=circle_column_name,  # type: ignore[arg-type]
                 square_column_name=square_column_name,  # type: ignore[arg-type]
                 reset_files=reset_files,
+                **kwargs,
             )
 
             actual_combined_labels = dict(clf.cfg.labels)
@@ -489,6 +493,7 @@ class Discover:
                 df,
                 column_name,  # type: ignore[arg-type]
                 reset_files=reset_files,
+                **kwargs,
             )
             actual_labels = dict(clf.cfg.labels)
             if actual_labels != labels:

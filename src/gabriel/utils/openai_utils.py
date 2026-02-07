@@ -4994,7 +4994,7 @@ async def get_all_responses(
                 concurrency_cap < growth_headroom_limit
                 and successes_since_adjust >= success_threshold
             ):
-                increment = max(1, int(math.ceil(max(concurrency_cap * 0.15, 2))))
+                increment = max(1, int(math.ceil(max(concurrency_cap * 0.1, 2))))
                 new_cap = min(ceiling_cap, concurrency_cap + increment)
                 if new_cap != concurrency_cap:
                     old_cap = concurrency_cap

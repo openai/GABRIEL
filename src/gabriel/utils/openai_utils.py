@@ -3021,7 +3021,7 @@ async def get_all_responses(
     # this ceiling to half of the requested value to avoid overwhelming
     # the API or tool backends.
     n_parallels: int = 650,
-    ramp_up_seconds: float = 20.0,
+    ramp_up_seconds: float = 15.0,
     ramp_up_start_fraction: float = 0.2,
     httpx_max_connections: Optional[int] = None,
     httpx_max_keepalive_connections: Optional[int] = None,

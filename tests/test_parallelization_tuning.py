@@ -130,7 +130,7 @@ def test_ramp_up_increases_parallelism(tmp_path):
     assert active["peak"] > 2
 
 
-def test_ramp_up_halts_on_rate_limit(tmp_path):
+def test_ramp_up_halts_on_rate_limit(tmp_path, capsys):
     active = {"current": 0, "peak": 0}
     lock = asyncio.Lock()
     first_error = {"raised": False}
@@ -168,4 +168,40 @@ def test_ramp_up_halts_on_rate_limit(tmp_path):
         )
     )
 
+    output = capsys.readouterr().out
+    assert "Halting ramp-up" in output
     assert active["peak"] <= 3
+
+
+def test_ramp_up_does_not_halt_after_window(tmp_path, capsys):
+    first_error = {"raised": False}
+
+    async def responder(prompt: str, **_: object):
+        if not first_error["raised"]:
+            first_error["raised"] = True
+            await asyncio.sleep(0.06)
+            raise openai_utils.RateLimitError("rate limit")
+        await asyncio.sleep(0.01)
+        return [f"ok-{prompt}"], 0.01, []
+
+    asyncio.run(
+        openai_utils.get_all_responses(
+            prompts=[f"p{i}" for i in range(4)],
+            identifiers=[f"p{i}" for i in range(4)],
+            response_fn=responder,
+            use_dummy=False,
+            save_path=str(tmp_path / "responses.csv"),
+            reset_files=True,
+            dynamic_timeout=False,
+            max_retries=1,
+            n_parallels=4,
+            ramp_up_seconds=0.05,
+            ramp_up_start_fraction=0.25,
+            status_report_interval=None,
+            global_cooldown=0,
+            logging_level="error",
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert "Halting ramp-up" not in output

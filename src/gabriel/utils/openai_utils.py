@@ -270,6 +270,32 @@ def _is_quota_error_message(message: str) -> bool:
     return bool(message) and "quota" in message.lower()
 
 
+def _classify_timeout_detail(detail: str) -> Optional[str]:
+    """Classify timeout exception detail strings for safer accounting."""
+
+    if not detail:
+        return None
+    detail_lower = detail.lower()
+    rate_markers = ("rate limit", "rate-limit", "too many requests", "http 429", " 429")
+    if any(marker in detail_lower for marker in rate_markers) or _is_quota_error_message(
+        detail_lower
+    ):
+        return "rate_limit"
+    connection_markers = (
+        "connection error",
+        "connection reset",
+        "connection refused",
+        "connection aborted",
+        "connection closed",
+        "network error",
+        "network unreachable",
+        "connection lost",
+    )
+    if any(marker in detail_lower for marker in connection_markers):
+        return "connection"
+    return None
+
+
 def _get_tokenizer(model_name: str) -> tiktoken.Encoding:
     """Return a tiktoken encoding for the model or a sensible default."""
     try:
@@ -2158,7 +2184,14 @@ async def get_response(
 
 def _ser(x: Any) -> Optional[str]:
     """Serialize Python objects deterministically."""
-    return None if x is None else json.dumps(x, ensure_ascii=False)
+    if x is None:
+        return None
+    try:
+        if pd.isna(x):
+            return None
+    except Exception:
+        pass
+    return json.dumps(x, ensure_ascii=False)
 
 
 def _de(x: Any) -> Any:
@@ -2531,8 +2564,16 @@ async def get_all_embeddings(
                 now = time.time()
                 if now < cooldown_until:
                     await asyncio.sleep(cooldown_until - now)
-                while active_workers >= concurrency_cap:
+                while True:
+                    if stop_event.is_set():
+                        break
+                    current_cap = _current_parallel_cap()
+                    if active_workers < current_cap:
+                        break
                     await asyncio.sleep(0.01)
+                if stop_event.is_set():
+                    queue.task_done()
+                    break
                 active_workers += 1
                 error_logs.setdefault(ident, [])
                 call_timeout = timeout
@@ -2935,6 +2976,8 @@ async def get_all_responses(
     # this ceiling to half of the requested value to avoid overwhelming
     # the API or tool backends.
     n_parallels: int = 650,
+    ramp_up_seconds: float = 20.0,
+    ramp_up_start_fraction: float = 0.25,
     max_retries: int = 3,
     timeout_factor: float = 2.5,
     max_timeout: Optional[float] = None,
@@ -3006,6 +3049,13 @@ async def get_all_responses(
     are handled similarly: the helper tracks recent connection failures over
     ``connection_error_window`` seconds and reduces parallelism when repeated
     failures occur, while logging a hint to check network stability.
+
+    To avoid slamming the API immediately, the worker pool can optionally ramp
+    up from a smaller starting concurrency.  When enabled, the effective cap
+    begins at ``ramp_up_start_fraction`` of the initial concurrency and
+    increases linearly to the full cap over ``ramp_up_seconds``.  If a
+    rate‑limit or connection error occurs during the ramp, the ramp is halted
+    and the current cap is preserved so adaptive scaling can take over.
 
     Timeout bursts now scale with the active level of parallelism.  The helper
     triggers a protective restart only after observing roughly 1.25× the
@@ -4309,6 +4359,26 @@ async def get_all_responses(
     timeout_burst_window = max(1.0, float(timeout_burst_window))
     timeout_burst_cooldown = max(1.0, float(timeout_burst_cooldown))
     timeout_burst_max_restarts = max(0, int(timeout_burst_max_restarts))
+    try:
+        ramp_up_seconds = float(ramp_up_seconds)
+    except (TypeError, ValueError):
+        ramp_up_seconds = 0.0
+    try:
+        ramp_up_start_fraction = float(ramp_up_start_fraction)
+    except (TypeError, ValueError):
+        ramp_up_start_fraction = 1.0
+    ramp_up_seconds = max(0.0, ramp_up_seconds)
+    ramp_up_start_fraction = max(0.0, min(1.0, ramp_up_start_fraction))
+    ramp_up_enabled = (
+        not use_batch
+        and ramp_up_seconds > 0
+        and 0.0 < ramp_up_start_fraction < 1.0
+        and concurrency_cap > 1
+    )
+    ramp_up_start_time = time.time()
+    ramp_up_end_time = ramp_up_start_time + ramp_up_seconds
+    ramp_up_start_cap = max(1, int(math.ceil(concurrency_cap * ramp_up_start_fraction)))
+    ramp_up_halted = False
 
     def _maybe_reduce_output_headroom(*, allow_reduce: bool) -> bool:
         """Lower output headroom after the first token estimate refresh."""
@@ -4355,8 +4425,21 @@ async def get_all_responses(
         logger.info(msg)
         return True
 
+    def _current_ramp_cap(now: Optional[float] = None) -> int:
+        if not ramp_up_enabled or ramp_up_halted:
+            return concurrency_cap
+        now = time.time() if now is None else now
+        if now >= ramp_up_end_time or ramp_up_seconds <= 0:
+            return concurrency_cap
+        progress = max(0.0, min(1.0, (now - ramp_up_start_time) / ramp_up_seconds))
+        target = ramp_up_start_cap + (concurrency_cap - ramp_up_start_cap) * progress
+        return max(1, int(math.ceil(target)))
+
+    def _current_parallel_cap(now: Optional[float] = None) -> int:
+        return min(concurrency_cap, _current_ramp_cap(now))
+
     def _effective_timeout_burst_threshold() -> int:
-        parallel_workers = max(1, max(active_workers, concurrency_cap))
+        parallel_workers = max(1, max(active_workers, _current_parallel_cap()))
         return int(math.ceil(parallel_workers * _TIMEOUT_BURST_RATIO))
 
     def _emit_first_error(
@@ -4413,6 +4496,19 @@ async def get_all_responses(
                 logger.debug("Connection error: %s", detail)
             else:
                 logger.debug("Connection error encountered.")
+
+    def _halt_ramp_up(reason: str) -> None:
+        nonlocal ramp_up_halted, concurrency_cap
+        if not ramp_up_enabled or ramp_up_halted:
+            return
+        ramp_cap = _current_ramp_cap()
+        ramp_up_halted = True
+        if concurrency_cap > ramp_cap:
+            concurrency_cap = ramp_cap
+        msg = f"[parallelization] Halting ramp-up at {ramp_cap} due to {reason}."
+        logger.warning(msg)
+        if message_verbose:
+            print(msg)
 
     def _record_timeout_event(now: Optional[float] = None) -> None:
         ts = now if now is not None else time.time()
@@ -4547,6 +4643,7 @@ async def get_all_responses(
         timeout_text = ""
         connection_text = ""
         total_completed = processed
+        effective_cap = _current_parallel_cap()
         if status.num_timeout_errors or total_completed:
             denom = max(total_completed, 1)
             timeout_text = f"timeouts={status.num_timeout_errors}/{denom}"
@@ -4572,13 +4669,15 @@ async def get_all_responses(
             if status_report_interval is not None and connection_errors_since_last_status:
                 connection_text += f" (+{connection_errors_since_last_status} since last)"
         status_bits: List[str] = [
-            f"cap={concurrency_cap}",
+            f"cap={effective_cap}",
             f"active={active_workers}",
             f"inflight={len(inflight)}",
             f"queue={queue.qsize()}",
             f"processed={processed}/{status.num_tasks_started}",
             f"rate_limit_errors={status.num_rate_limit_errors}",
         ]
+        if ramp_up_enabled and not ramp_up_halted and effective_cap < concurrency_cap:
+            status_bits.insert(1, f"ramp_target={concurrency_cap}")
         if cost_text:
             status_bits.insert(0, cost_text)
         if planned_ppm is not None:
@@ -4594,6 +4693,14 @@ async def get_all_responses(
         logger.info(msg)
 
     emit_parallelization_status("Initial parallelization settings", force=True)
+    if ramp_up_enabled and concurrency_cap > 1:
+        ramp_msg = (
+            f"[parallelization] Ramping up from {ramp_up_start_cap} to {concurrency_cap} "
+            f"over {int(ramp_up_seconds)}s."
+        )
+        logger.info(ramp_msg)
+        if message_verbose:
+            print(ramp_msg)
 
     def _maybe_refresh_estimates(trigger_reason: str, *, force: bool = False) -> bool:
         """Update token and cost estimates from observed usage."""
@@ -4914,11 +5021,109 @@ async def get_all_responses(
                     queue.put_nowait((prompt, ident, attempts_left - 1))
                     return True
 
+                async def _handle_rate_limit_error(error_text: str) -> None:
+                    nonlocal cooldown_until, rate_limit_errors_since_adjust, successes_since_adjust, processed
+                    inflight.pop(ident, None)
+                    status.num_rate_limit_errors += 1
+                    status.time_of_last_rate_limit_error = time.time()
+                    cooldown_until = status.time_of_last_rate_limit_error + global_cooldown
+                    _log_rate_limit_once(error_text)
+                    error_logs[ident].append(error_text)
+                    rate_limit_error_times.append(time.time())
+                    rate_limit_errors_since_adjust += 1
+                    successes_since_adjust = 0
+                    _halt_ramp_up("rate limit error")
+                    if _is_quota_error_message(error_text):
+                        fatal_msg = (
+                            "Quota exceeded (billing or credit balance likely exhausted). "
+                            "Add funds at https://platform.openai.com/settings/organization/billing/. "
+                            "Stopping remaining requests."
+                        )
+                        logger.error(fatal_msg)
+                        error_logs[ident].append(fatal_msg)
+                        row = {
+                            "Identifier": ident,
+                            "Response": None,
+                            "Time Taken": None,
+                            "Input Tokens": input_tokens,
+                            "Reasoning Tokens": None,
+                            "Output Tokens": None,
+                            "Reasoning Effort": get_response_kwargs.get(
+                                "reasoning_effort", reasoning_effort
+                            ),
+                            "Successful": False,
+                            "Error Log": error_logs.get(ident, []),
+                        }
+                        if response_ids:
+                            row["Response IDs"] = response_ids
+                        if reasoning_summary is not None:
+                            row["Reasoning Summary"] = None
+                        results.append(row)
+                        processed += 1
+                        status.num_tasks_failed += 1
+                        status.num_tasks_in_progress -= 1
+                        pbar.update(1)
+                        drained = 0
+                        while not queue.empty():
+                            try:
+                                queue.get_nowait()
+                                queue.task_done()
+                                drained += 1
+                            except asyncio.QueueEmpty:
+                                break
+                        if drained:
+                            status.num_tasks_failed += drained
+                            status.num_tasks_in_progress -= drained
+                            processed += drained
+                            pbar.update(drained)
+                        stop_event.set()
+                        await flush()
+                        raise RuntimeError(fatal_msg)
+                    _maybe_refresh_estimates("rate-limit encountered", force=False)
+                    maybe_adjust_concurrency()
+                    if attempts_left - 1 > 0:
+                        backoff = random.uniform(1, 2) * (2 ** (max_retries - attempts_left))
+                        await _maybe_retry(backoff)
+                    else:
+                        row = {
+                            "Identifier": ident,
+                            "Response": None,
+                            "Time Taken": None,
+                            "Input Tokens": input_tokens,
+                            "Reasoning Tokens": None,
+                            "Output Tokens": None,
+                            "Reasoning Effort": get_response_kwargs.get(
+                                "reasoning_effort", reasoning_effort
+                            ),
+                            "Successful": False,
+                            "Error Log": error_logs.get(ident, []),
+                        }
+                        if response_ids:
+                            row["Response IDs"] = response_ids
+                        if reasoning_summary is not None:
+                            row["Reasoning Summary"] = None
+                        results.append(row)
+                        processed += 1
+                        status.num_tasks_failed += 1
+                        status.num_tasks_in_progress -= 1
+                        pbar.update(1)
+                        error_logs.pop(ident, None)
+                        _maybe_trigger_threshold_refresh()
+                        await flush()
+
                 now = time.time()
                 if now < cooldown_until:
                     await asyncio.sleep(cooldown_until - now)
-                while active_workers >= concurrency_cap:
+                while True:
+                    if stop_event.is_set():
+                        break
+                    current_cap = _current_parallel_cap()
+                    if active_workers < current_cap:
+                        break
                     await asyncio.sleep(0.01)
+                if stop_event.is_set():
+                    queue.task_done()
+                    break
                 active_workers += 1
                 input_tokens = len(tokenizer.encode(prompt))
                 gating_output = estimated_output_tokens
@@ -4993,6 +5198,20 @@ async def get_all_responses(
                 )
                 response_ids: List[str] = []
                 try:
+                    stop_waiter = asyncio.create_task(stop_event.wait())
+                    done, _ = await asyncio.wait(
+                        {task, stop_waiter}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if stop_waiter in done:
+                        if not task.done():
+                            task.cancel()
+                        inflight.pop(ident, None)
+                        raise asyncio.CancelledError()
+                    stop_waiter.cancel()
+                    try:
+                        await stop_waiter
+                    except asyncio.CancelledError:
+                        pass
                     result = await task
                 except asyncio.CancelledError:
                     inflight.pop(ident, None)
@@ -5305,6 +5524,7 @@ async def get_all_responses(
                 elapsed = time.time() - start
                 error_detail = str(e).strip()
                 detail_lower = error_detail.lower()
+                error_category = _classify_timeout_detail(detail_lower)
                 looks_like_timeout = (
                     isinstance(e, (asyncio.TimeoutError, APITimeoutError))
                     and (
@@ -5314,7 +5534,47 @@ async def get_all_responses(
                         or "timed out" in detail_lower
                     )
                 )
-                if looks_like_timeout:
+                if error_category == "rate_limit":
+                    await _handle_rate_limit_error(error_detail or "rate limit error")
+                elif error_category == "connection":
+                    inflight.pop(ident, None)
+                    status.num_api_errors += 1
+                    status.num_connection_errors += 1
+                    _log_connection_once(error_detail or "Connection error")
+                    error_logs[ident].append(error_detail or "Connection error")
+                    connection_error_times.append(time.time())
+                    connection_errors_since_adjust += 1
+                    connection_errors_since_last_status += 1
+                    _halt_ramp_up("connection error")
+                    maybe_adjust_for_connection_errors()
+                    if attempts_left - 1 > 0 and not stop_event.is_set():
+                        backoff = random.uniform(1, 2) * (2 ** (max_retries - attempts_left))
+                        await _maybe_retry(backoff)
+                    else:
+                        row = {
+                            "Identifier": ident,
+                            "Response": None,
+                            "Time Taken": None,
+                            "Input Tokens": input_tokens,
+                            "Reasoning Tokens": None,
+                            "Output Tokens": None,
+                            "Reasoning Effort": get_response_kwargs.get(
+                                "reasoning_effort", reasoning_effort
+                            ),
+                            "Successful": False,
+                            "Error Log": error_logs.get(ident, []),
+                        }
+                        if reasoning_summary is not None:
+                            row["Reasoning Summary"] = None
+                        results.append(row)
+                        processed += 1
+                        status.num_tasks_failed += 1
+                        status.num_tasks_in_progress -= 1
+                        pbar.update(1)
+                        error_logs.pop(ident, None)
+                        _maybe_trigger_threshold_refresh()
+                        await flush()
+                elif looks_like_timeout:
                     status.num_timeout_errors += 1
                     _trigger_timeout_burst(time.time())
                     inflight.pop(ident, None)
@@ -5384,13 +5644,6 @@ async def get_all_responses(
                     if error_detail:
                         base_message = f"{base_message}: {error_detail}"
                         error_logs[ident].append(error_detail)
-                    if "connection error" in detail_lower:
-                        status.num_connection_errors += 1
-                        connection_errors_since_adjust += 1
-                        connection_errors_since_last_status += 1
-                        connection_error_times.append(time.time())
-                        maybe_adjust_for_connection_errors()
-                        _log_connection_once(base_message)
                     error_key: Hashable = (
                         "non-timeout-error",
                         type(e).__name__,
@@ -5474,93 +5727,8 @@ async def get_all_responses(
                     _maybe_trigger_threshold_refresh()
                     await flush()
             except RateLimitError as e:
-                inflight.pop(ident, None)
-                status.num_rate_limit_errors += 1
-                status.time_of_last_rate_limit_error = time.time()
-                cooldown_until = status.time_of_last_rate_limit_error + global_cooldown
                 error_text = str(e)
-                _log_rate_limit_once(error_text)
-                error_logs[ident].append(error_text)
-                rate_limit_error_times.append(time.time())
-                rate_limit_errors_since_adjust += 1
-                successes_since_adjust = 0
-                if _is_quota_error_message(error_text):
-                    fatal_msg = (
-                        "Quota exceeded (billing or credit balance likely exhausted). "
-                        "Add funds at https://platform.openai.com/settings/organization/billing/. "
-                        "Stopping remaining requests."
-                    )
-                    logger.error(fatal_msg)
-                    error_logs[ident].append(fatal_msg)
-                    row = {
-                        "Identifier": ident,
-                        "Response": None,
-                        "Time Taken": None,
-                        "Input Tokens": input_tokens,
-                        "Reasoning Tokens": None,
-                        "Output Tokens": None,
-                        "Reasoning Effort": get_response_kwargs.get(
-                            "reasoning_effort", reasoning_effort
-                        ),
-                        "Successful": False,
-                        "Error Log": error_logs.get(ident, []),
-                    }
-                    if response_ids:
-                        row["Response IDs"] = response_ids
-                    if reasoning_summary is not None:
-                        row["Reasoning Summary"] = None
-                    results.append(row)
-                    processed += 1
-                    status.num_tasks_failed += 1
-                    status.num_tasks_in_progress -= 1
-                    pbar.update(1)
-                    drained = 0
-                    while not queue.empty():
-                        try:
-                            queue.get_nowait()
-                            queue.task_done()
-                            drained += 1
-                        except asyncio.QueueEmpty:
-                            break
-                    if drained:
-                        status.num_tasks_failed += drained
-                        status.num_tasks_in_progress -= drained
-                        processed += drained
-                        pbar.update(drained)
-                    stop_event.set()
-                    await flush()
-                    raise RuntimeError(fatal_msg)
-                _maybe_refresh_estimates("rate-limit encountered", force=False)
-                maybe_adjust_concurrency()
-                if attempts_left - 1 > 0:
-                    backoff = random.uniform(1, 2) * (2 ** (max_retries - attempts_left))
-                    await _maybe_retry(backoff)
-                else:
-                    row = {
-                        "Identifier": ident,
-                        "Response": None,
-                        "Time Taken": None,
-                        "Input Tokens": input_tokens,
-                        "Reasoning Tokens": None,
-                        "Output Tokens": None,
-                        "Reasoning Effort": get_response_kwargs.get(
-                            "reasoning_effort", reasoning_effort
-                        ),
-                        "Successful": False,
-                        "Error Log": error_logs.get(ident, []),
-                    }
-                    if response_ids:
-                        row["Response IDs"] = response_ids
-                    if reasoning_summary is not None:
-                        row["Reasoning Summary"] = None
-                    results.append(row)
-                    processed += 1
-                    status.num_tasks_failed += 1
-                    status.num_tasks_in_progress -= 1
-                    pbar.update(1)
-                    error_logs.pop(ident, None)
-                    _maybe_trigger_threshold_refresh()
-                    await flush()
+                await _handle_rate_limit_error(error_text)
             except APIConnectionError as e:
                 inflight.pop(ident, None)
                 status.num_api_errors += 1
@@ -5570,6 +5738,7 @@ async def get_all_responses(
                 connection_error_times.append(time.time())
                 connection_errors_since_adjust += 1
                 connection_errors_since_last_status += 1
+                _halt_ramp_up("connection error")
                 maybe_adjust_for_connection_errors()
                 if attempts_left - 1 > 0 and not stop_event.is_set():
                     backoff = random.uniform(1, 2) * (2 ** (max_retries - attempts_left))
@@ -5690,7 +5859,10 @@ async def get_all_responses(
     status_task: Optional[asyncio.Task] = None
     if status_report_interval is not None:
         status_task = asyncio.create_task(status_reporter())
-    initial_worker_count = max(1, min(_effective_parallel_ceiling(), queue.qsize()))
+    initial_worker_count = max(
+        1,
+        min(_effective_parallel_ceiling(), _current_parallel_cap(), queue.qsize()),
+    )
     workers = [asyncio.create_task(worker()) for _ in range(initial_worker_count)]
     try:
         await queue.join()
@@ -5782,6 +5954,8 @@ async def get_all_responses(
             save_path=save_path,
             reset_files=False,
             n_parallels=n_parallels,
+            ramp_up_seconds=ramp_up_seconds,
+            ramp_up_start_fraction=ramp_up_start_fraction,
             max_retries=max_retries,
             timeout_factor=timeout_factor,
             max_timeout=max_timeout,

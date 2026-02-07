@@ -148,3 +148,28 @@ def test_non_timeout_error_preserved(tmp_path: Path) -> None:
     error_logs = df["Error Log"].iloc[0]
     assert any("boom" in str(msg) for msg in error_logs)
     assert not any("timeout" in str(msg).lower() for msg in error_logs)
+
+
+def test_connection_timeout_does_not_count_as_timeout(tmp_path: Path) -> None:
+    async def flaky_responder(prompt: str, **_: object):
+        raise openai_utils.APITimeoutError("Connection error")
+
+    save_path = tmp_path / "responses.csv"
+    df: pd.DataFrame = asyncio.run(
+        openai_utils.get_all_responses(
+            prompts=["p1"],
+            identifiers=["p1"],
+            response_fn=flaky_responder,
+            use_dummy=False,
+            save_path=str(save_path),
+            reset_files=True,
+            dynamic_timeout=False,
+            max_retries=1,
+            n_parallels=1,
+            logging_level="error",
+        )
+    )
+
+    error_logs = df["Error Log"].iloc[0]
+    assert any("connection error" in str(msg).lower() for msg in error_logs)
+    assert not any("timed out" in str(msg).lower() for msg in error_logs)

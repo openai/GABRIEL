@@ -1,3 +1,4 @@
+import asyncio
 import time
 
 from gabriel.utils import openai_utils
@@ -93,3 +94,78 @@ def test_wait_based_cap_allows_gentle_growth():
 def test_rate_limit_decrement_is_aggressive():
     assert openai_utils._rate_limit_decrement(50) == 20
     assert openai_utils._rate_limit_decrement(3) == 3
+
+
+def test_ramp_up_increases_parallelism(tmp_path):
+    active = {"current": 0, "peak": 0}
+    lock = asyncio.Lock()
+
+    async def responder(prompt: str, **_: object):
+        async with lock:
+            active["current"] += 1
+            active["peak"] = max(active["peak"], active["current"])
+        await asyncio.sleep(0.05)
+        async with lock:
+            active["current"] -= 1
+        return [f"ok-{prompt}"], 0.01, []
+
+    asyncio.run(
+        openai_utils.get_all_responses(
+            prompts=[f"p{i}" for i in range(12)],
+            identifiers=[f"p{i}" for i in range(12)],
+            response_fn=responder,
+            use_dummy=False,
+            save_path=str(tmp_path / "responses.csv"),
+            reset_files=True,
+            dynamic_timeout=False,
+            max_retries=1,
+            n_parallels=8,
+            ramp_up_seconds=0.1,
+            ramp_up_start_fraction=0.25,
+            status_report_interval=None,
+            logging_level="error",
+        )
+    )
+
+    assert active["peak"] > 2
+
+
+def test_ramp_up_halts_on_rate_limit(tmp_path):
+    active = {"current": 0, "peak": 0}
+    lock = asyncio.Lock()
+    first_error = {"raised": False}
+
+    async def responder(prompt: str, **_: object):
+        async with lock:
+            active["current"] += 1
+            active["peak"] = max(active["peak"], active["current"])
+        if not first_error["raised"]:
+            first_error["raised"] = True
+            async with lock:
+                active["current"] -= 1
+            raise openai_utils.RateLimitError("rate limit")
+        await asyncio.sleep(0.2)
+        async with lock:
+            active["current"] -= 1
+        return [f"ok-{prompt}"], 0.01, []
+
+    asyncio.run(
+        openai_utils.get_all_responses(
+            prompts=[f"p{i}" for i in range(10)],
+            identifiers=[f"p{i}" for i in range(10)],
+            response_fn=responder,
+            use_dummy=False,
+            save_path=str(tmp_path / "responses.csv"),
+            reset_files=True,
+            dynamic_timeout=False,
+            max_retries=1,
+            n_parallels=8,
+            ramp_up_seconds=0.1,
+            ramp_up_start_fraction=0.25,
+            status_report_interval=None,
+            global_cooldown=0,
+            logging_level="error",
+        )
+    )
+
+    assert active["peak"] <= 3

@@ -205,6 +205,7 @@ class StatusTracker:
     num_timeout_errors: int = 0
     num_other_errors: int = 0
     time_of_last_rate_limit_error: float = 0.0
+    time_of_last_connection_error: float = 0.0
 
 
 @dataclass
@@ -2977,8 +2978,8 @@ async def get_all_responses(
     # this ceiling to half of the requested value to avoid overwhelming
     # the API or tool backends.
     n_parallels: int = 650,
-    ramp_up_seconds: float = 20.0,
-    ramp_up_start_fraction: float = 0.15,
+    ramp_up_seconds: float = 15.0,
+    ramp_up_start_fraction: float = 0.2,
     max_retries: int = 3,
     timeout_factor: float = 2.5,
     max_timeout: Optional[float] = None,
@@ -3037,12 +3038,13 @@ async def get_all_responses(
     or disable this behaviour with ``background_mode`` and adjust the polling
     cadence via ``background_poll_interval``.
 
-    Concurrency adapts gently to sustained rate‑limit pressure.  A rolling
-    window (``rate_limit_window``, default 30 seconds) tracks recent rate‑limit
-    errors and only reduces the parallel worker cap when many errors occur
-    within that window or when a long streak of consecutive errors is
-    observed.  After a reduction the helper waits for another full window
-    before scaling down again so brief spikes do not trigger runaway
+    Concurrency adapts gently to sustained rate‑limit or connection‑error
+    pressure.  Rolling windows (``rate_limit_window`` and
+    ``connection_error_window``; default 30 seconds) track recent errors and
+    only reduce the parallel worker cap when many combined errors occur within
+    that window or when a long streak of consecutive errors is observed.  After
+    a reduction the helper waits for another full window before scaling down
+    again so brief spikes do not trigger runaway
     throttling, while successful calls reset the counters and allow the pool to
     scale back up.
 
@@ -4316,7 +4318,6 @@ async def get_all_responses(
     last_concurrency_scale_up = 0.0
     connection_error_times: Deque[float] = deque()
     connection_errors_since_adjust = 0
-    last_connection_scale_down = 0.0
     usage_samples: List[Tuple[int, int, int]] = []
     estimated_output_tokens = planning_output_tokens
     estimated_output_tokens_per_prompt_live = float(planning_output_tokens)
@@ -4922,111 +4923,90 @@ async def get_all_responses(
         return None
 
     def maybe_adjust_concurrency() -> None:
-        nonlocal concurrency_cap, rate_limit_errors_since_adjust, successes_since_adjust, max_parallel_ceiling, last_concurrency_scale_down, last_concurrency_scale_up, last_rate_limit_concurrency_change, throughput_ceiling_ppm
-        if not manage_rate_limits:
-            return
+        nonlocal concurrency_cap, rate_limit_errors_since_adjust, successes_since_adjust, max_parallel_ceiling, last_concurrency_scale_down, last_concurrency_scale_up, last_rate_limit_concurrency_change, throughput_ceiling_ppm, connection_errors_since_adjust
         now = time.time()
-        window_start = now - rate_limit_window
-        while rate_limit_error_times and rate_limit_error_times[0] < window_start:
+        if not manage_rate_limits and not connection_error_times and connection_errors_since_adjust == 0:
+            return
+        rate_window_start = now - rate_limit_window
+        while rate_limit_error_times and rate_limit_error_times[0] < rate_window_start:
             rate_limit_error_times.popleft()
-        recent_errors = len(rate_limit_error_times)
-        error_window_threshold = max(6, int(math.ceil(concurrency_cap * 0.08)))
+        connection_window_start = now - connection_error_window
+        while connection_error_times and connection_error_times[0] < connection_window_start:
+            connection_error_times.popleft()
+        recent_rate_limit_errors = len(rate_limit_error_times) if manage_rate_limits else 0
+        recent_connection_errors = len(connection_error_times)
+        recent_combined_errors = recent_rate_limit_errors + recent_connection_errors
+        total_errors_since_adjust = (
+            (rate_limit_errors_since_adjust if manage_rate_limits else 0)
+            + connection_errors_since_adjust
+        )
+        error_window = max(rate_limit_window, connection_error_window)
+        error_window_threshold = max(6, int(math.ceil(concurrency_cap * 0.07)))
         consecutive_threshold = max(3, int(math.ceil(concurrency_cap * 0.05)))
-        should_scale_down = False
-        if recent_errors >= error_window_threshold:
-            should_scale_down = True
-        elif rate_limit_errors_since_adjust >= consecutive_threshold:
-            should_scale_down = True
-        if should_scale_down and (now - last_concurrency_scale_down) >= max(1.0, rate_limit_window * 0.75):
+        should_scale_down = (
+            recent_combined_errors >= error_window_threshold
+            or total_errors_since_adjust >= consecutive_threshold
+        )
+        if should_scale_down and (now - last_concurrency_scale_down) >= max(
+            1.0, error_window * 0.75
+        ):
             decrement = _rate_limit_decrement(concurrency_cap)
             new_cap = max(1, concurrency_cap - decrement)
             if new_cap != concurrency_cap:
                 old_cap = concurrency_cap
                 concurrency_cap = new_cap
                 reason = (
-                    f"[rate-limit recovery] Cutting workers from {old_cap} to {new_cap} "
-                    f"after {recent_errors} rate-limit errors in the last {int(round(rate_limit_window))}s."
+                    f"[parallel recovery] Cutting workers from {old_cap} to {new_cap} "
+                    f"after {recent_combined_errors} combined rate-limit/connection errors in the last "
+                    f"{int(round(error_window))}s (rate-limit={recent_rate_limit_errors}, "
+                    f"connection={recent_connection_errors})."
                 )
                 logger.warning(reason)
-                _halt_ramp_up("rate limit recovery")
+                _halt_ramp_up("error recovery")
                 emit_parallelization_status(reason, force=True)
-            else:
-                concurrency_cap = new_cap
             rate_limit_errors_since_adjust = 0
+            connection_errors_since_adjust = 0
             successes_since_adjust = 0
             rate_limit_error_times.clear()
+            connection_error_times.clear()
             last_concurrency_scale_down = now
             last_rate_limit_concurrency_change = now
             return
-        quiet_since_last_error = (now - status.time_of_last_rate_limit_error) >= rate_limit_window
+        quiet_since_last_error = (
+            (now - status.time_of_last_rate_limit_error) >= rate_limit_window
+            and (now - status.time_of_last_connection_error) >= connection_error_window
+        )
         ceiling_cap = _effective_parallel_ceiling()
         if (
             rate_limit_errors_since_adjust == 0
+            and connection_errors_since_adjust == 0
             and concurrency_cap < ceiling_cap
             and quiet_since_last_error
-            and (now - last_concurrency_scale_down) >= rate_limit_window
-            and (now - last_concurrency_scale_up) >= rate_limit_window
+            and (now - last_concurrency_scale_down) >= error_window
+            and (now - last_concurrency_scale_up) >= error_window
         ):
             growth_headroom_limit = max(1, int(math.floor(ceiling_cap * 0.9)))
-            success_threshold = max(50, int(math.ceil(concurrency_cap * 1.5)))
+            success_threshold = max(60, int(math.ceil(concurrency_cap * 2.5)))
             if (
                 concurrency_cap < growth_headroom_limit
                 and successes_since_adjust >= success_threshold
             ):
-                increment = max(1, int(math.ceil(max(concurrency_cap * 0.08, 1))))
+                increment = max(1, int(math.ceil(max(concurrency_cap * 0.05, 1))))
                 new_cap = min(ceiling_cap, concurrency_cap + increment)
                 if new_cap != concurrency_cap:
                     old_cap = concurrency_cap
                     concurrency_cap = new_cap
                     reason = (
-                        f"[rate-limit recovery] Increasing workers from {old_cap} to {new_cap} after sustained success."
+                        "[parallel recovery] Increasing workers from "
+                        f"{old_cap} to {new_cap} after sustained success without rate-limit or connection errors."
                     )
                     logger.info(reason)
                     emit_parallelization_status(reason, force=True)
                     last_concurrency_scale_up = now
                     last_rate_limit_concurrency_change = now
-                else:
-                    concurrency_cap = new_cap
                 successes_since_adjust = 0
                 rate_limit_errors_since_adjust = 0
-
-    def maybe_adjust_for_connection_errors() -> None:
-        nonlocal concurrency_cap, connection_errors_since_adjust, last_connection_scale_down
-        nonlocal last_rate_limit_concurrency_change
-        now = time.time()
-        window_start = now - connection_error_window
-        while connection_error_times and connection_error_times[0] < window_start:
-            connection_error_times.popleft()
-        recent_errors = len(connection_error_times)
-        error_window_threshold = max(3, int(math.ceil(concurrency_cap * 0.06)))
-        consecutive_threshold = max(2, int(math.ceil(concurrency_cap * 0.04)))
-        should_scale_down = False
-        if recent_errors >= error_window_threshold:
-            should_scale_down = True
-        elif connection_errors_since_adjust >= consecutive_threshold:
-            should_scale_down = True
-        if should_scale_down and (
-            (now - last_connection_scale_down) >= max(1.0, connection_error_window * 0.75)
-        ):
-            decrement = _connection_error_decrement(concurrency_cap)
-            new_cap = max(1, concurrency_cap - decrement)
-            if new_cap != concurrency_cap:
-                old_cap = concurrency_cap
-                concurrency_cap = new_cap
-                reason = (
-                    f"[network recovery] Cutting workers from {old_cap} to {new_cap} "
-                    f"after {recent_errors} connection errors in the last "
-                    f"{int(round(connection_error_window))}s. "
-                    "If this persists, check network stability or bandwidth limits, "
-                    "or reduce `n_parallels`."
-                )
-                logger.warning(reason)
-                _halt_ramp_up("connection errors")
-                emit_parallelization_status(reason, force=True)
-            connection_errors_since_adjust = 0
-            connection_error_times.clear()
-            last_connection_scale_down = now
-            last_rate_limit_concurrency_change = now
+                connection_errors_since_adjust = 0
 
     async def worker() -> None:
         nonlocal processed, call_count, nonlocal_timeout, active_workers, concurrency_cap, cooldown_until
@@ -5359,12 +5339,10 @@ async def get_all_responses(
                         if new_cap < 1:
                             new_cap = 1
                         now = time.time()
-                        last_connection_error = (
-                            connection_error_times[-1] if connection_error_times else 0.0
-                        )
                         safe_to_increase = (
                             (now - status.time_of_last_rate_limit_error) >= rate_limit_window
-                            and (now - last_connection_error) >= connection_error_window
+                            and (now - status.time_of_last_connection_error)
+                            >= connection_error_window
                         )
                         if new_cap > concurrency_cap:
                             max_increase = max(1, int(math.ceil(concurrency_cap * 0.12)))
@@ -5574,13 +5552,14 @@ async def get_all_responses(
                     inflight.pop(ident, None)
                     status.num_api_errors += 1
                     status.num_connection_errors += 1
+                    status.time_of_last_connection_error = time.time()
                     _log_connection_once(error_detail or "Connection error")
                     error_logs[ident].append(error_detail or "Connection error")
                     connection_error_times.append(time.time())
                     connection_errors_since_adjust += 1
                     connection_errors_since_last_status += 1
                     _halt_ramp_up("connection error")
-                    maybe_adjust_for_connection_errors()
+                    maybe_adjust_concurrency()
                     if attempts_left - 1 > 0 and not stop_event.is_set():
                         backoff = random.uniform(1, 2) * (2 ** (max_retries - attempts_left))
                         await _maybe_retry(backoff)
@@ -5767,13 +5746,14 @@ async def get_all_responses(
                 inflight.pop(ident, None)
                 status.num_api_errors += 1
                 status.num_connection_errors += 1
+                status.time_of_last_connection_error = time.time()
                 _log_connection_once(str(e))
                 error_logs[ident].append(str(e))
                 connection_error_times.append(time.time())
                 connection_errors_since_adjust += 1
                 connection_errors_since_last_status += 1
                 _halt_ramp_up("connection error")
-                maybe_adjust_for_connection_errors()
+                maybe_adjust_concurrency()
                 if attempts_left - 1 > 0 and not stop_event.is_set():
                     backoff = random.uniform(1, 2) * (2 ** (max_retries - attempts_left))
                     await _maybe_retry(backoff)

@@ -2469,6 +2469,8 @@ async def get_all_embeddings(
         queue.put_nowait((item[1], item[0], max_retries))
 
     processed = 0
+    print(f"[get_all_embeddings] Starting embedding run for {len(items)} texts")
+    logger.info("[get_all_embeddings] Starting embedding run for %s texts", len(items))
     pbar = _progress_bar(
         total=len(items),
         desc="Getting embeddings",
@@ -2728,6 +2730,8 @@ async def get_all_embeddings(
         pbar.close()
         with open(save_path, "wb") as f:
             pickle.dump(embeddings, f)
+        print(f"[get_all_embeddings] Completed embedding run; saved to {save_path}")
+        logger.info("[get_all_embeddings] Completed embedding run; saved to %s", save_path)
 
     return embeddings
 

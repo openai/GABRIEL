@@ -38,6 +38,7 @@ class DeduplicateConfig:
     group_size: int = 500
     modality: str = "entity"
     max_words_per_text: int = 500
+    verbose: bool = True
 
     def __post_init__(self) -> None:
         if self.additional_instructions is not None:
@@ -127,7 +128,7 @@ class Deduplicate:
                 save_path=os.path.join(self.cfg.save_dir, "deduplicate_embeddings.pkl"),
                 reset_file=reset_files and run_idx == 0,
                 use_dummy=self.cfg.use_dummy,
-                verbose=False,
+                verbose=self.cfg.verbose,
             )
             if emb:
                 arr = np.array([emb[u] for u in uniques], dtype=float)

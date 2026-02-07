@@ -41,6 +41,7 @@ class MergeConfig:
     auto_match_threshold: float = 0.75
     use_best_auto_match: bool = False
     candidate_scan_chunks: int = 5
+    verbose: bool = True
 
     def __post_init__(self) -> None:
         if self.additional_instructions is not None:
@@ -152,7 +153,7 @@ class Merge:
                 save_path=os.path.join(self.cfg.save_dir, "short_embeddings.pkl"),
                 reset_file=reset_files,
                 use_dummy=self.cfg.use_dummy,
-                verbose=False,
+                verbose=self.cfg.verbose,
             )
             long_emb = await get_all_embeddings(
                 texts=long_uniques,
@@ -160,7 +161,7 @@ class Merge:
                 save_path=os.path.join(self.cfg.save_dir, "long_embeddings.pkl"),
                 reset_file=reset_files,
                 use_dummy=self.cfg.use_dummy,
-                verbose=False,
+                verbose=self.cfg.verbose,
             )
 
         matches: Dict[str, str] = {}

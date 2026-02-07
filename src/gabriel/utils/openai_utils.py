@@ -2977,7 +2977,7 @@ async def get_all_responses(
     # the API or tool backends.
     n_parallels: int = 650,
     ramp_up_seconds: float = 20.0,
-    ramp_up_start_fraction: float = 0.25,
+    ramp_up_start_fraction: float = 0.15,
     max_retries: int = 3,
     timeout_factor: float = 2.5,
     max_timeout: Optional[float] = None,
@@ -4349,6 +4349,7 @@ async def get_all_responses(
     timeout_notes: Deque[str] = deque(maxlen=3)
     timeout_errors_since_last_status = 0
     connection_errors_since_last_status = 0
+    rate_limit_errors_since_last_status = 0
     first_timeout_logged = False
     first_rate_limit_logged = False
     first_connection_logged = False
@@ -4474,9 +4475,13 @@ async def get_all_responses(
     def _log_rate_limit_once(detail: Optional[str] = None) -> None:
         nonlocal first_rate_limit_logged
         if not first_rate_limit_logged:
-            logger.warning(
-                "Encountered first rate limit error. Future rate limit errors will be silenced and tracked in periodic updates."
+            msg = (
+                "Encountered first rate limit error. Future rate limit errors will be silenced "
+                "and tracked in periodic updates."
             )
+            logger.warning(msg)
+            if not quiet:
+                print(f"[rate limit] {msg}")
             first_rate_limit_logged = True
         else:
             if detail:
@@ -4487,9 +4492,13 @@ async def get_all_responses(
     def _log_connection_once(detail: Optional[str] = None) -> None:
         nonlocal first_connection_logged
         if not first_connection_logged:
-            logger.warning(
-                "Encountered first connection error. Future connection errors will be silenced and tracked in periodic updates."
+            msg = (
+                "Encountered first connection error. Future connection errors will be silenced "
+                "and tracked in periodic updates."
             )
+            logger.warning(msg)
+            if not quiet:
+                print(f"[connection] {msg}")
             first_connection_logged = True
         else:
             if detail:
@@ -4507,7 +4516,7 @@ async def get_all_responses(
             concurrency_cap = ramp_cap
         msg = f"[parallelization] Halting ramp-up at {ramp_cap} due to {reason}."
         logger.warning(msg)
-        if message_verbose:
+        if not quiet:
             print(msg)
 
     def _record_timeout_event(now: Optional[float] = None) -> None:
@@ -4642,6 +4651,7 @@ async def get_all_responses(
         )
         timeout_text = ""
         connection_text = ""
+        rate_limit_text = ""
         total_completed = processed
         effective_cap = _current_parallel_cap()
         if status.num_timeout_errors or total_completed:
@@ -4664,17 +4674,20 @@ async def get_all_responses(
             total_cost, sampled = cost_snapshot
             cost_text = f"cost_so_far={'~' if sampled else ''}${total_cost:.2f}"
         prefix = f"[{label}] " if label else ""
-        if status.num_connection_errors or connection_errors_since_last_status:
-            connection_text = f"connection_errors={status.num_connection_errors}"
-            if status_report_interval is not None and connection_errors_since_last_status:
-                connection_text += f" (+{connection_errors_since_last_status} since last)"
+        denom = max(total_completed, 1)
+        rate_limit_text = f"rate_limit_errors={status.num_rate_limit_errors}/{denom}"
+        if status_report_interval is not None and rate_limit_errors_since_last_status:
+            rate_limit_text += f" (+{rate_limit_errors_since_last_status} since last)"
+        connection_text = f"connection_errors={status.num_connection_errors}/{denom}"
+        if status_report_interval is not None and connection_errors_since_last_status:
+            connection_text += f" (+{connection_errors_since_last_status} since last)"
         status_bits: List[str] = [
             f"cap={effective_cap}",
             f"active={active_workers}",
             f"inflight={len(inflight)}",
             f"queue={queue.qsize()}",
             f"processed={processed}/{status.num_tasks_started}",
-            f"rate_limit_errors={status.num_rate_limit_errors}",
+            rate_limit_text,
         ]
         if ramp_up_enabled and not ramp_up_halted and effective_cap < concurrency_cap:
             status_bits.insert(1, f"ramp_target={concurrency_cap}")
@@ -4688,7 +4701,7 @@ async def get_all_responses(
         if connection_text:
             status_bits.append(connection_text)
         msg = f"{prefix}{timestamp} | {reason_clean}: " + ", ".join(status_bits)
-        if message_verbose:
+        if (message_verbose or force) and not quiet:
             print(msg)
         logger.info(msg)
 
@@ -4696,10 +4709,10 @@ async def get_all_responses(
     if ramp_up_enabled and concurrency_cap > 1:
         ramp_msg = (
             f"[parallelization] Ramping up from {ramp_up_start_cap} to {concurrency_cap} "
-            f"over {int(ramp_up_seconds)}s."
+            f"parallel threads over {int(ramp_up_seconds)}s."
         )
         logger.info(ramp_msg)
-        if message_verbose:
+        if not quiet:
             print(ramp_msg)
 
     def _maybe_refresh_estimates(trigger_reason: str, *, force: bool = False) -> bool:
@@ -4928,11 +4941,14 @@ async def get_all_responses(
             last_rate_limit_concurrency_change = now
             return
         quiet_since_last_error = (now - status.time_of_last_rate_limit_error) >= rate_limit_window
+        last_connection_error = connection_error_times[-1] if connection_error_times else 0.0
+        quiet_since_last_connection = (now - last_connection_error) >= connection_error_window
         ceiling_cap = _effective_parallel_ceiling()
         if (
             rate_limit_errors_since_adjust == 0
             and concurrency_cap < ceiling_cap
             and quiet_since_last_error
+            and quiet_since_last_connection
             and (now - last_concurrency_scale_down) >= rate_limit_window
             and (now - last_concurrency_scale_up) >= rate_limit_window
         ):
@@ -5023,8 +5039,10 @@ async def get_all_responses(
 
                 async def _handle_rate_limit_error(error_text: str) -> None:
                     nonlocal cooldown_until, rate_limit_errors_since_adjust, successes_since_adjust, processed
+                    nonlocal rate_limit_errors_since_last_status
                     inflight.pop(ident, None)
                     status.num_rate_limit_errors += 1
+                    rate_limit_errors_since_last_status += 1
                     status.time_of_last_rate_limit_error = time.time()
                     cooldown_until = status.time_of_last_rate_limit_error + global_cooldown
                     _log_rate_limit_once(error_text)
@@ -5545,6 +5563,7 @@ async def get_all_responses(
                     connection_error_times.append(time.time())
                     connection_errors_since_adjust += 1
                     connection_errors_since_last_status += 1
+                    successes_since_adjust = 0
                     _halt_ramp_up("connection error")
                     maybe_adjust_for_connection_errors()
                     if attempts_left - 1 > 0 and not stop_event.is_set():
@@ -5738,6 +5757,7 @@ async def get_all_responses(
                 connection_error_times.append(time.time())
                 connection_errors_since_adjust += 1
                 connection_errors_since_last_status += 1
+                successes_since_adjust = 0
                 _halt_ramp_up("connection error")
                 maybe_adjust_for_connection_errors()
                 if attempts_left - 1 > 0 and not stop_event.is_set():
@@ -5842,6 +5862,7 @@ async def get_all_responses(
             return
         try:
             nonlocal timeout_errors_since_last_status, connection_errors_since_last_status
+            nonlocal rate_limit_errors_since_last_status
             while not stop_event.is_set():
                 await asyncio.sleep(status_report_interval)
                 if stop_event.is_set() or processed >= status.num_tasks_started:
@@ -5851,11 +5872,48 @@ async def get_all_responses(
                 )
                 timeout_errors_since_last_status = 0
                 connection_errors_since_last_status = 0
+                rate_limit_errors_since_last_status = 0
+        except asyncio.CancelledError:
+            pass
+
+    async def worker_manager() -> None:
+        try:
+            while not stop_event.is_set():
+                await asyncio.sleep(0.5)
+                if stop_event.is_set() or queue.empty():
+                    continue
+                desired = min(
+                    _effective_parallel_ceiling(),
+                    _current_parallel_cap(),
+                    queue.qsize(),
+                )
+                if desired > len(workers):
+                    workers.extend(
+                        asyncio.create_task(worker())
+                        for _ in range(desired - len(workers))
+                    )
+        except asyncio.CancelledError:
+            pass
+
+    async def ramp_monitor() -> None:
+        if not ramp_up_enabled or ramp_up_halted:
+            return
+        try:
+            while not stop_event.is_set():
+                await asyncio.sleep(0.5)
+                if stop_event.is_set() or ramp_up_halted:
+                    break
+                if time.time() >= ramp_up_end_time:
+                    emit_parallelization_status("Ramp-up complete", force=True)
+                    break
         except asyncio.CancelledError:
             pass
 
     # Spawn workers and ensure they are cleaned up on exit or cancellation
+    workers: List[asyncio.Task] = []
     watcher = asyncio.create_task(timeout_watcher())
+    manager = asyncio.create_task(worker_manager())
+    ramp_task = asyncio.create_task(ramp_monitor())
     status_task: Optional[asyncio.Task] = None
     if status_report_interval is not None:
         status_task = asyncio.create_task(status_reporter())
@@ -5863,7 +5921,7 @@ async def get_all_responses(
         1,
         min(_effective_parallel_ceiling(), _current_parallel_cap(), queue.qsize()),
     )
-    workers = [asyncio.create_task(worker()) for _ in range(initial_worker_count)]
+    workers.extend(asyncio.create_task(worker()) for _ in range(initial_worker_count))
     try:
         await queue.join()
     except (asyncio.CancelledError, KeyboardInterrupt):
@@ -5875,10 +5933,12 @@ async def get_all_responses(
         for w in workers:
             w.cancel()
         watcher.cancel()
+        manager.cancel()
+        ramp_task.cancel()
         if status_task is not None:
             status_task.cancel()
         worker_results = await asyncio.gather(*workers, return_exceptions=True)
-        await asyncio.gather(watcher, return_exceptions=True)
+        await asyncio.gather(watcher, manager, ramp_task, return_exceptions=True)
         if status_task is not None:
             await asyncio.gather(status_task, return_exceptions=True)
         for res in worker_results:

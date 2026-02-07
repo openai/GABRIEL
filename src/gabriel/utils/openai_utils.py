@@ -200,6 +200,7 @@ class StatusTracker:
     num_tasks_succeeded: int = 0
     num_tasks_failed: int = 0
     num_rate_limit_errors: int = 0
+    num_connection_errors: int = 0
     num_api_errors: int = 0
     num_timeout_errors: int = 0
     num_other_errors: int = 0
@@ -1213,6 +1214,12 @@ def _rate_limit_decrement(concurrency_cap: int) -> int:
     """Return a downward step that curbs rate-limit thrash aggressively."""
 
     return max(2, int(math.ceil(max(concurrency_cap * 0.4, 3))))
+
+
+def _connection_error_decrement(concurrency_cap: int) -> int:
+    """Return a step-down size for connection errors matching rate-limit aggression."""
+
+    return _rate_limit_decrement(concurrency_cap)
 
 
 def _smooth_wait_based_cap(
@@ -2904,6 +2911,7 @@ async def get_all_responses(
     quiet: bool = False,
     global_cooldown: int = 15,
     rate_limit_window: float = 30.0,
+    connection_error_window: float = 30.0,
     token_sample_size: int = 20,
     status_report_interval: Optional[float] = 120.0,
     planning_rate_limit_buffer: float = PLANNING_RATE_LIMIT_BUFFER,
@@ -2948,6 +2956,11 @@ async def get_all_responses(
     before scaling down again so brief spikes do not trigger runaway
     throttling, while successful calls reset the counters and allow the pool to
     scale back up.
+
+    Connection errors (e.g., transient network drops, Wi‑Fi/VPN instability, or bandwidth limitations)
+    are handled similarly: the helper tracks recent connection failures over
+    ``connection_error_window`` seconds and reduces parallelism when repeated
+    failures occur, while logging a hint to check network stability.
 
     Timeout bursts now scale with the active level of parallelism.  The helper
     triggers a protective restart only after observing roughly 1.25× the
@@ -4201,9 +4214,13 @@ async def get_all_responses(
     successes_since_adjust = 0
     active_workers = 0
     rate_limit_window = max(1.0, float(rate_limit_window))
+    connection_error_window = max(1.0, float(connection_error_window))
     rate_limit_error_times: Deque[float] = deque()
     last_concurrency_scale_down = 0.0
     last_concurrency_scale_up = 0.0
+    connection_error_times: Deque[float] = deque()
+    connection_errors_since_adjust = 0
+    last_connection_scale_down = 0.0
     usage_samples: List[Tuple[int, int, int]] = []
     estimated_output_tokens = planning_output_tokens
     estimated_output_tokens_per_prompt_live = float(planning_output_tokens)
@@ -4236,6 +4253,7 @@ async def get_all_responses(
     last_wait_adjust = 0.0
     timeout_notes: Deque[str] = deque(maxlen=3)
     timeout_errors_since_last_status = 0
+    connection_errors_since_last_status = 0
     first_timeout_logged = False
     current_tokens_per_call = float(estimated_tokens_per_call)
     last_rate_limit_concurrency_change = 0.0
@@ -4454,6 +4472,7 @@ async def get_all_responses(
             context="reporting parallelization status",
         )
         timeout_text = ""
+        connection_text = ""
         total_completed = processed
         if status.num_timeout_errors or total_completed:
             denom = max(total_completed, 1)
@@ -4475,6 +4494,10 @@ async def get_all_responses(
             total_cost, sampled = cost_snapshot
             cost_text = f"cost_so_far={'~' if sampled else ''}${total_cost:.2f}"
         prefix = f"[{label}] " if label else ""
+        if status.num_connection_errors or connection_errors_since_last_status:
+            connection_text = f"connection_errors={status.num_connection_errors}"
+            if status_report_interval is not None and connection_errors_since_last_status:
+                connection_text += f" (+{connection_errors_since_last_status} since last)"
         status_bits: List[str] = [
             f"cap={concurrency_cap}",
             f"active={active_workers}",
@@ -4490,6 +4513,8 @@ async def get_all_responses(
             status_bits.append(ppm_piece)
         if timeout_text:
             status_bits.append(timeout_text)
+        if connection_text:
+            status_bits.append(connection_text)
         msg = f"{prefix}{timestamp} | {reason_clean}: " + ", ".join(status_bits)
         if message_verbose:
             print(msg)
@@ -4754,12 +4779,50 @@ async def get_all_responses(
                 successes_since_adjust = 0
                 rate_limit_errors_since_adjust = 0
 
+    def maybe_adjust_for_connection_errors() -> None:
+        nonlocal concurrency_cap, connection_errors_since_adjust, last_connection_scale_down
+        nonlocal last_rate_limit_concurrency_change
+        now = time.time()
+        window_start = now - connection_error_window
+        while connection_error_times and connection_error_times[0] < window_start:
+            connection_error_times.popleft()
+        recent_errors = len(connection_error_times)
+        error_window_threshold = max(3, int(math.ceil(concurrency_cap * 0.06)))
+        consecutive_threshold = max(2, int(math.ceil(concurrency_cap * 0.04)))
+        should_scale_down = False
+        if recent_errors >= error_window_threshold:
+            should_scale_down = True
+        elif connection_errors_since_adjust >= consecutive_threshold:
+            should_scale_down = True
+        if should_scale_down and (
+            (now - last_connection_scale_down) >= max(1.0, connection_error_window * 0.75)
+        ):
+            decrement = _connection_error_decrement(concurrency_cap)
+            new_cap = max(1, concurrency_cap - decrement)
+            if new_cap != concurrency_cap:
+                old_cap = concurrency_cap
+                concurrency_cap = new_cap
+                reason = (
+                    f"[network recovery] Cutting workers from {old_cap} to {new_cap} "
+                    f"after {recent_errors} connection errors in the last "
+                    f"{int(round(connection_error_window))}s. "
+                    "If this persists, check network stability or bandwidth limits, "
+                    "or reduce `n_parallels`."
+                )
+                logger.warning(reason)
+                emit_parallelization_status(reason, force=True)
+            connection_errors_since_adjust = 0
+            connection_error_times.clear()
+            last_connection_scale_down = now
+            last_rate_limit_concurrency_change = now
+
     async def worker() -> None:
         nonlocal processed, call_count, nonlocal_timeout, active_workers, concurrency_cap, cooldown_until
         nonlocal estimated_output_tokens, rate_limit_errors_since_adjust, successes_since_adjust, stop_event
         nonlocal max_parallel_ceiling, last_wait_adjust, current_tokens_per_call, timeout_errors_since_last_status
         nonlocal throughput_ceiling_ppm, observed_input_tokens_total, observed_output_tokens_total
-        nonlocal observed_reasoning_tokens_total, observed_usage_count
+        nonlocal observed_reasoning_tokens_total, observed_usage_count, connection_errors_since_adjust
+        nonlocal connection_errors_since_last_status
         while True:
             if stop_event.is_set():
                 break
@@ -4970,7 +5033,13 @@ async def get_all_responses(
                         if new_cap < 1:
                             new_cap = 1
                         now = time.time()
-                        safe_to_increase = (now - status.time_of_last_rate_limit_error) >= rate_limit_window
+                        last_connection_error = (
+                            connection_error_times[-1] if connection_error_times else 0.0
+                        )
+                        safe_to_increase = (
+                            (now - status.time_of_last_rate_limit_error) >= rate_limit_window
+                            and (now - last_connection_error) >= connection_error_window
+                        )
                         if new_cap > concurrency_cap:
                             max_increase = max(1, int(math.ceil(concurrency_cap * 0.12)))
                             if not safe_to_increase:
@@ -5148,6 +5217,7 @@ async def get_all_responses(
                     status.num_tasks_succeeded += 1
                     successes_since_adjust += 1
                     rate_limit_errors_since_adjust = 0
+                    connection_errors_since_adjust = 0
                     maybe_adjust_concurrency()
                     _maybe_trigger_threshold_refresh()
                     if processed % save_every_x_responses == 0:
@@ -5241,13 +5311,26 @@ async def get_all_responses(
                     if error_detail:
                         base_message = f"{base_message}: {error_detail}"
                         error_logs[ident].append(error_detail)
+                    if "connection error" in detail_lower:
+                        status.num_connection_errors += 1
+                        connection_errors_since_adjust += 1
+                        connection_errors_since_last_status += 1
+                        connection_error_times.append(time.time())
+                        maybe_adjust_for_connection_errors()
+                        _emit_first_error(
+                            f"{base_message}. This can indicate network instability or bandwidth limitations.",
+                            dedup_key=("connection-error", error_detail or None),
+                        )
                     error_key: Hashable = (
                         "non-timeout-error",
                         type(e).__name__,
                         error_detail or None,
                     )
-                    _emit_first_error(base_message, dedup_key=error_key)
-                    logger.warning(base_message)
+                    if "connection error" not in detail_lower:
+                        _emit_first_error(base_message, dedup_key=error_key)
+                        logger.warning(base_message)
+                    else:
+                        logger.debug(base_message)
                     if attempts_left - 1 > 0:
                         backoff = random.uniform(1, 2) * (2 ** (max_retries - attempts_left))
                         await _maybe_retry(backoff)
@@ -5412,9 +5495,17 @@ async def get_all_responses(
             except APIConnectionError as e:
                 inflight.pop(ident, None)
                 status.num_api_errors += 1
-                logger.warning(f"Connection error for {ident}: {e}")
-                _emit_first_error(f"Connection error encountered: {e}")
+                status.num_connection_errors += 1
+                _emit_first_error(
+                    f"Connection error encountered: {e}. This can indicate network instability or bandwidth limitations.",
+                    dedup_key=("connection-error", str(e)),
+                )
+                logger.debug(f"Connection error for {ident}: {e}")
                 error_logs[ident].append(str(e))
+                connection_error_times.append(time.time())
+                connection_errors_since_adjust += 1
+                connection_errors_since_last_status += 1
+                maybe_adjust_for_connection_errors()
                 if attempts_left - 1 > 0 and not stop_event.is_set():
                     backoff = random.uniform(1, 2) * (2 ** (max_retries - attempts_left))
                     await _maybe_retry(backoff)
@@ -5516,7 +5607,7 @@ async def get_all_responses(
         if status_report_interval is None:
             return
         try:
-            nonlocal timeout_errors_since_last_status
+            nonlocal timeout_errors_since_last_status, connection_errors_since_last_status
             while not stop_event.is_set():
                 await asyncio.sleep(status_report_interval)
                 if stop_event.is_set() or processed >= status.num_tasks_started:
@@ -5525,6 +5616,7 @@ async def get_all_responses(
                     "Periodic status update", force=True, label=None
                 )
                 timeout_errors_since_last_status = 0
+                connection_errors_since_last_status = 0
         except asyncio.CancelledError:
             pass
 
@@ -5646,6 +5738,7 @@ async def get_all_responses(
             quiet=quiet,
             global_cooldown=global_cooldown,
             rate_limit_window=rate_limit_window,
+            connection_error_window=connection_error_window,
             token_sample_size=token_sample_size,
             status_report_interval=status_report_interval,
             planning_rate_limit_buffer=planning_rate_limit_buffer,
@@ -5660,7 +5753,12 @@ async def get_all_responses(
         logger.warning(f"{status.num_tasks_failed} requests failed.")
     if status.num_rate_limit_errors > 0:
         logger.warning(
-            f"{status.num_rate_limit_errors} rate limit errors encountered; consider reducing concurrency."
+            f"{status.num_rate_limit_errors} rate limit errors encountered; consider reducing concurrency via lower n_parallels."
+        )
+    if status.num_connection_errors > 0:
+        logger.warning(
+            f"{status.num_connection_errors} API connection errors encountered, indicating network instability or bandwidth limitations; "
+            "consider reducing concurrency via lower n_parallels."
         )
     if status.num_timeout_errors > 0:
         logger.warning(f"{status.num_timeout_errors} timeouts encountered.")

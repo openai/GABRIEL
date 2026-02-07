@@ -5895,11 +5895,29 @@ async def get_all_responses(
     status_task: Optional[asyncio.Task] = None
     if status_report_interval is not None:
         status_task = asyncio.create_task(status_reporter())
-    initial_worker_count = max(
-        1,
-        min(_effective_parallel_ceiling(), _current_parallel_cap(), queue.qsize()),
-    )
-    workers = [asyncio.create_task(worker()) for _ in range(initial_worker_count)]
+    workers: List[asyncio.Task] = []
+
+    def _desired_worker_count() -> int:
+        return max(
+            1,
+            min(_effective_parallel_ceiling(), _current_parallel_cap(), queue.qsize()),
+        )
+
+    async def worker_spawner() -> None:
+        try:
+            while not stop_event.is_set():
+                _maybe_emit_ramp_complete()
+                desired = _desired_worker_count()
+                if desired > len(workers):
+                    for _ in range(desired - len(workers)):
+                        workers.append(asyncio.create_task(worker()))
+                await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            pass
+
+    initial_worker_count = _desired_worker_count()
+    workers.extend(asyncio.create_task(worker()) for _ in range(initial_worker_count))
+    spawner = asyncio.create_task(worker_spawner())
     try:
         await queue.join()
     except (asyncio.CancelledError, KeyboardInterrupt):
@@ -5911,9 +5929,11 @@ async def get_all_responses(
         for w in workers:
             w.cancel()
         watcher.cancel()
+        spawner.cancel()
         if status_task is not None:
             status_task.cancel()
         worker_results = await asyncio.gather(*workers, return_exceptions=True)
+        await asyncio.gather(spawner, return_exceptions=True)
         await asyncio.gather(watcher, return_exceptions=True)
         if status_task is not None:
             await asyncio.gather(status_task, return_exceptions=True)

@@ -1779,7 +1779,7 @@ async def get_response(
     elif background_mode is not None:
         effective_background = bool(background_mode)
     else:
-        effective_background = False
+        effective_background = timeout is None
     background_argument: Optional[bool] = None
     if explicit_background is not None:
         background_argument = bool(explicit_background)

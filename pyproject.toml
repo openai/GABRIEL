@@ -5,17 +5,27 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "openai-gabriel"
 version = "1.0.2"
-description = "LLM-based social-science analysis library"
-authors = [{name = "GABRIEL Contributors"}]
+description = "LLM-based library to measure quantitative attributes on qualitative data"
+authors = [
+    {name = "Hemanth Asirvatham"},
+    {name = "Elliott Mokski"},
+]
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.7"
 keywords = [
     "llm",
-    "nlp",
-    "social-science",
-    "machine-learning",
+    "gpt",
+    "openai",
+    "ai",
     "research",
+    "academic",
+    "econ",
+    "economics",
+    "econometrics",
+    "machine learning",
+    "social sciences",
+    "text analysis",
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",

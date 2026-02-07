@@ -2421,6 +2421,9 @@ async def get_all_embeddings(
     get_embedding_kwargs.setdefault("base_url", base_url)
     error_logs: Dict[str, List[str]] = defaultdict(list)
     queue: asyncio.Queue[Tuple[str, str, int]] = asyncio.Queue()
+    first_timeout_logged = False
+    first_rate_limit_logged = False
+    first_connection_logged = False
     for item in items:
         queue.put_nowait((item[1], item[0], max_retries))
 
@@ -2473,6 +2476,42 @@ async def get_all_embeddings(
                 concurrency_cap = new_cap
                 successes_since_adjust = 0
                 rate_limit_errors_since_adjust = 0
+
+    def _log_embedding_timeout_once(message: str) -> None:
+        nonlocal first_timeout_logged
+        if not first_timeout_logged:
+            logger.warning(
+                "Encountered first timeout error. Future timeout errors will be silenced."
+            )
+            first_timeout_logged = True
+        else:
+            logger.debug("Timeout error: %s", message)
+
+    def _log_embedding_rate_limit_once(detail: Optional[str] = None) -> None:
+        nonlocal first_rate_limit_logged
+        if not first_rate_limit_logged:
+            logger.warning(
+                "Encountered first rate limit error. Future rate limit errors will be silenced."
+            )
+            first_rate_limit_logged = True
+        else:
+            if detail:
+                logger.debug("Rate limit error: %s", detail)
+            else:
+                logger.debug("Rate limit error encountered.")
+
+    def _log_embedding_connection_once(detail: Optional[str] = None) -> None:
+        nonlocal first_connection_logged
+        if not first_connection_logged:
+            logger.warning(
+                "Encountered first connection error. Future connection errors will be silenced."
+            )
+            first_connection_logged = True
+        else:
+            if detail:
+                logger.debug("Connection error: %s", detail)
+            else:
+                logger.debug("Connection error encountered.")
 
     async def worker() -> None:
         nonlocal processed, cooldown_until, active_workers, concurrency_cap
@@ -2540,7 +2579,7 @@ async def get_all_embeddings(
                 else:
                     error_message = f"API call timed out after {elapsed:.2f} s"
                 error_logs[ident].append(error_message)
-                logger.warning(f"Timeout error for {ident}: {error_message}")
+                _log_embedding_timeout_once(error_message)
                 if attempts_left - 1 > 0:
                     backoff = random.uniform(1, 2) * (2 ** (max_retries - attempts_left))
                     await asyncio.sleep(backoff)
@@ -2554,7 +2593,7 @@ async def get_all_embeddings(
                             pickle.dump(embeddings, f)
             except RateLimitError as e:
                 error_logs[ident].append(str(e))
-                logger.warning(f"Rate limit error for {ident}: {e}")
+                _log_embedding_rate_limit_once(str(e))
                 cooldown_until = time.time() + global_cooldown
                 rate_limit_errors_since_adjust += 1
                 successes_since_adjust = 0
@@ -2572,7 +2611,7 @@ async def get_all_embeddings(
                             pickle.dump(embeddings, f)
             except APIConnectionError as e:
                 error_logs[ident].append(str(e))
-                logger.warning(f"Connection error for {ident}: {e}")
+                _log_embedding_connection_once(str(e))
                 if attempts_left - 1 > 0:
                     backoff = random.uniform(1, 2) * (2 ** (max_retries - attempts_left))
                     await asyncio.sleep(backoff)
@@ -4255,6 +4294,8 @@ async def get_all_responses(
     timeout_errors_since_last_status = 0
     connection_errors_since_last_status = 0
     first_timeout_logged = False
+    first_rate_limit_logged = False
+    first_connection_logged = False
     current_tokens_per_call = float(estimated_tokens_per_call)
     last_rate_limit_concurrency_change = 0.0
     restart_requested = False
@@ -4340,6 +4381,32 @@ async def get_all_responses(
             first_timeout_logged = True
         else:
             logger.debug("Timeout error: %s", message)
+
+    def _log_rate_limit_once(detail: Optional[str] = None) -> None:
+        nonlocal first_rate_limit_logged
+        if not first_rate_limit_logged:
+            logger.warning(
+                "Encountered first rate limit error. Future rate limit errors will be silenced and tracked in periodic updates."
+            )
+            first_rate_limit_logged = True
+        else:
+            if detail:
+                logger.debug("Rate limit error: %s", detail)
+            else:
+                logger.debug("Rate limit error encountered.")
+
+    def _log_connection_once(detail: Optional[str] = None) -> None:
+        nonlocal first_connection_logged
+        if not first_connection_logged:
+            logger.warning(
+                "Encountered first connection error. Future connection errors will be silenced and tracked in periodic updates."
+            )
+            first_connection_logged = True
+        else:
+            if detail:
+                logger.debug("Connection error: %s", detail)
+            else:
+                logger.debug("Connection error encountered.")
 
     def _record_timeout_event(now: Optional[float] = None) -> None:
         ts = now if now is not None else time.time()
@@ -5317,10 +5384,7 @@ async def get_all_responses(
                         connection_errors_since_last_status += 1
                         connection_error_times.append(time.time())
                         maybe_adjust_for_connection_errors()
-                        _emit_first_error(
-                            f"{base_message}. This can indicate network instability or bandwidth limitations.",
-                            dedup_key=("connection-error", error_detail or None),
-                        )
+                        _log_connection_once(base_message)
                     error_key: Hashable = (
                         "non-timeout-error",
                         type(e).__name__,
@@ -5409,8 +5473,7 @@ async def get_all_responses(
                 status.time_of_last_rate_limit_error = time.time()
                 cooldown_until = status.time_of_last_rate_limit_error + global_cooldown
                 error_text = str(e)
-                logger.warning(f"Rate limit error for {ident}: {e}")
-                _emit_first_error(f"Rate limit error encountered: {error_text}")
+                _log_rate_limit_once(error_text)
                 error_logs[ident].append(error_text)
                 rate_limit_error_times.append(time.time())
                 rate_limit_errors_since_adjust += 1
@@ -5496,11 +5559,7 @@ async def get_all_responses(
                 inflight.pop(ident, None)
                 status.num_api_errors += 1
                 status.num_connection_errors += 1
-                _emit_first_error(
-                    f"Connection error encountered: {e}. This can indicate network instability or bandwidth limitations.",
-                    dedup_key=("connection-error", str(e)),
-                )
-                logger.debug(f"Connection error for {ident}: {e}")
+                _log_connection_once(str(e))
                 error_logs[ident].append(str(e))
                 connection_error_times.append(time.time())
                 connection_errors_since_adjust += 1

@@ -1420,6 +1420,7 @@ def test_rank_outputs_zscores_and_raw_columns(tmp_path):
         assert attr in df.columns
         assert f"{attr}_raw" in df.columns
         assert f"{attr}_se" in df.columns
+        assert f"{attr}_component" in df.columns
         assert np.isfinite(df[f"{attr}_se"].fillna(0.0)).all()
 
 
@@ -1459,7 +1460,20 @@ def test_rank_drops_malformed_rows_in_text_mode(tmp_path, capsys):
     assert set(df["text"]) == {"good", "great"}
 
 
-def test_recursive_rank_drops_malformed_rows_in_text_mode(tmp_path, capsys):
+def test_recursive_rank_drops_malformed_rows_in_text_mode(
+    monkeypatch, tmp_path, capsys
+):
+    async def fake_get_all_responses(*, identifiers, **kwargs):
+        return pd.DataFrame(
+            {
+                "Identifier": identifiers,
+                "Response": ['{"clarity": "draw"}'] * len(identifiers),
+            }
+        )
+
+    monkeypatch.setattr(
+        "gabriel.tasks.rank.get_all_responses", fake_get_all_responses
+    )
     cfg = RankConfig(
         attributes={"clarity": ""},
         save_dir=str(tmp_path),
@@ -1491,7 +1505,18 @@ def test_rank_primer_centering():
     assert ratings["b"]["clarity"] == 10.0
 
 
-def test_recursive_rank_outputs(tmp_path):
+def test_recursive_rank_outputs(monkeypatch, tmp_path):
+    async def fake_get_all_responses(*, identifiers, **kwargs):
+        return pd.DataFrame(
+            {
+                "Identifier": identifiers,
+                "Response": ['{"clarity": "draw"}'] * len(identifiers),
+            }
+        )
+
+    monkeypatch.setattr(
+        "gabriel.tasks.rank.get_all_responses", fake_get_all_responses
+    )
     cfg = RankConfig(
         attributes={"clarity": ""},
         save_dir=str(tmp_path),
@@ -1536,11 +1561,13 @@ def test_api_rank_hides_raw_columns(tmp_path):
         assert attr in df.columns
         assert f"{attr}_raw" not in df.columns
         assert f"{attr}_se" not in df.columns
+        assert f"{attr}_component" in df.columns
     final_path = tmp_path / "rankings_final.csv"
     saved = pd.read_csv(final_path)
     for attr in ("clarity", "originality"):
         assert f"{attr}_raw" in saved.columns
         assert f"{attr}_se" in saved.columns
+        assert f"{attr}_component" in saved.columns
 
 
 def test_api_rank_can_return_raw_scores_when_requested(tmp_path):
@@ -1563,6 +1590,153 @@ def test_api_rank_can_return_raw_scores_when_requested(tmp_path):
         assert attr in df.columns
         assert f"{attr}_raw" in df.columns
         assert f"{attr}_se" in df.columns
+
+
+@pytest.mark.parametrize("recursive", [False, True])
+def test_api_rank_replaces_same_named_input_column_without_duplicates(
+    tmp_path, recursive
+):
+    data = pd.DataFrame(
+        {"text": ["first", "second"], "quality": ["old-a", "old-b"]}
+    )
+    result = asyncio.run(
+        gabriel.rank(
+            data,
+            "text",
+            attributes={"quality": ""},
+            save_dir=str(tmp_path),
+            file_name="rankings.csv",
+            use_dummy=True,
+            n_rounds=1,
+            matches_per_round=1,
+            n_parallels=4,
+            initial_rating_pass=False,
+            recursive=recursive,
+            recursive_rate_first_round=False,
+        )
+    )
+
+    assert list(result.columns).count("quality") == 1
+    assert list(result.columns).count("text") == 1
+
+
+@pytest.mark.parametrize("persisted_attributes", [{"quality": ""}, ["quality"]])
+def test_api_rank_cached_load_respects_raw_score_projection(
+    tmp_path, persisted_attributes
+):
+    pd.DataFrame(
+        {
+            "quality": [0.0],
+            "quality_raw": [1.2],
+            "quality_se": [0.3],
+            "quality_component": [0],
+            "temperature": [20.0],
+            "temperature_raw": [19.5],
+            "temperature_se": [0.1],
+            "temperature_component": [7],
+        }
+    ).to_csv(tmp_path / "rankings_final.csv", index=False)
+    (tmp_path / "attributes.json").write_text(json.dumps({"unrelated": ""}))
+    (tmp_path / "rankings_attrs.json").write_text(json.dumps(persisted_attributes))
+
+    public = asyncio.run(
+        gabriel.rank(
+            None,
+            "text",
+            attributes={"quality": ""},
+            save_dir=str(tmp_path),
+            return_raw_scores=False,
+        )
+    )
+    detailed = asyncio.run(
+        gabriel.rank(
+            None,
+            "text",
+            attributes={"quality": ""},
+            save_dir=str(tmp_path),
+            return_raw_scores=True,
+        )
+    )
+    mismatched = asyncio.run(
+        gabriel.rank(
+            None,
+            "text",
+            attributes={"different": ""},
+            save_dir=str(tmp_path),
+            return_raw_scores=False,
+        )
+    )
+
+    assert "quality_raw" not in public
+    assert "quality_se" not in public
+    assert "quality_component" in public
+    assert "quality_raw" not in mismatched
+    assert "quality_se" not in mismatched
+    assert {"temperature_raw", "temperature_se"}.issubset(public.columns)
+    assert {"quality_raw", "quality_se"}.issubset(detailed.columns)
+
+
+def test_api_recursive_cache_preserves_user_suffix_columns(tmp_path):
+    recursive_dir = tmp_path / "rankings_recursive"
+    recursive_dir.mkdir()
+    pd.DataFrame(
+        {
+            "text": ["sample"],
+            "quality": [0.0],
+            "quality_raw": ["user value"],
+            "quality_se": ["user value"],
+            "overall_rank": [1],
+            "exit_stage": [1],
+        }
+    ).to_csv(recursive_dir / "recursive_final.csv", index=False)
+
+    result = asyncio.run(
+        gabriel.rank(
+            None,
+            "text",
+            attributes={"quality": ""},
+            save_dir=str(tmp_path),
+            recursive=True,
+            return_raw_scores=False,
+        )
+    )
+    assert {"quality_raw", "quality_se"}.issubset(result.columns)
+
+
+def test_empty_recursive_rank_matches_nonempty_public_schema(tmp_path):
+    result = asyncio.run(
+        gabriel.rank(
+            pd.DataFrame({"id": [], "text": []}),
+            "text",
+            id_column="id",
+            attributes={"quality": ""},
+            save_dir=str(tmp_path),
+            recursive=True,
+            recursive_rate_first_round=False,
+            use_dummy=True,
+            reset_files=True,
+        )
+    )
+    assert "quality" in result.columns
+    assert "quality_raw" not in result.columns
+    assert "quality_se" not in result.columns
+
+
+@pytest.mark.parametrize("override", [{"max_retries": 2}, {"json_mode": False}])
+def test_api_rank_rejects_response_settings_owned_by_transaction(override, tmp_path):
+    with pytest.raises(TypeError, match=next(iter(override))):
+        asyncio.run(
+            gabriel.rank(
+                pd.DataFrame({"text": ["first", "second"]}),
+                "text",
+                attributes={"quality": ""},
+                save_dir=str(tmp_path),
+                use_dummy=True,
+                n_rounds=1,
+                matches_per_round=1,
+                **override,
+            )
+        )
 
 
 def test_deidentifier_dummy(tmp_path):
@@ -2393,7 +2567,7 @@ def test_rank_pdf_round_and_catchup_forward_prompt_pdfs(monkeypatch, tmp_path):
     assert any(call.get("prompt_pdfs") for call in calls)
 
 
-def test_rank_resume_ignores_nan_batch_rows(tmp_path):
+def test_rank_resume_rejects_nan_batch_rows(tmp_path):
     cfg = RankConfig(
         attributes={"clarity": ""},
         save_dir=str(tmp_path),
@@ -2409,17 +2583,31 @@ def test_rank_resume_ignores_nan_batch_rows(tmp_path):
             "Identifier": ["x"],
             "Response": ["{}"],
             "Batch": [np.nan],
+            "Pair": [0],
             "IdA": ["a"],
             "IdB": ["b"],
         }
     ).to_csv(round0, index=False)
-
     task = Rank(cfg)
-    data = pd.DataFrame({"text": ["first", "second"]})
-    df = asyncio.run(task.run(data, column_name="text", reset_files=False))
+    (tmp_path / "rankings_run_metadata.json").write_text(
+        json.dumps(
+            {
+                "rank_estimator_version": 2,
+                "insufficient_signal_policy": "tie",
+                "learning_rate": 0.1,
+                "last_completed_round": 0,
+                "modality": "text",
+                "input_fingerprints": {"a": "0" * 40, "b": "1" * 40},
+                "measurement_spec_fingerprint": task._measurement_spec_fingerprint(),
+            }
+        )
+    )
 
-    assert "clarity" in df.columns
-    assert len(df) == 2
+    data = pd.DataFrame({"text": ["first", "second"]})
+    before = round0.read_bytes()
+    with pytest.raises(ValueError, match="Could not replay Rank checkpoint"):
+        asyncio.run(task.run(data, column_name="text", reset_files=False))
+    assert round0.read_bytes() == before
 
 
 def test_seed_api_passes_embedding_overrides(monkeypatch, tmp_path):

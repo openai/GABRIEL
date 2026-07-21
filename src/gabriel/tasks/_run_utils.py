@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 from typing import Any, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 import pandas as pd
@@ -44,7 +45,21 @@ def load_run_metadata(save_dir: str, base_name: str, *, reset_files: bool) -> Di
     return payload if isinstance(payload, dict) else {}
 
 
-def update_run_metadata(save_dir: str, base_name: str, **updates: Any) -> None:
+def update_run_metadata(
+    save_dir: str,
+    base_name: str,
+    *,
+    strict: bool = False,
+    **updates: Any,
+) -> None:
+    """Merge and atomically persist task metadata.
+
+    Most tasks historically treated metadata as best-effort bookkeeping, so
+    the default retains that behavior. Tasks whose checkpoint correctness
+    depends on a commit marker can set ``strict=True`` to surface read or write
+    failures rather than silently advancing with ambiguous state.
+    """
+
     path = run_metadata_path(save_dir, base_name)
     payload: Dict[str, Any] = {}
     try:
@@ -53,16 +68,37 @@ def update_run_metadata(save_dir: str, base_name: str, **updates: Any) -> None:
                 loaded = json.load(f)
             if isinstance(loaded, dict):
                 payload.update(loaded)
+            elif strict:
+                raise ValueError(f"Run metadata {path!r} is not a JSON object")
     except Exception:
+        if strict:
+            raise
         payload = {}
     payload.setdefault("metadata_version", 1)
     payload.update(updates)
+    temporary_path: Optional[str] = None
     try:
         os.makedirs(save_dir, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        file_descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f".{base_name}_run_metadata.",
+            suffix=".tmp",
+            dir=save_dir,
+            text=True,
+        )
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
     except Exception:
-        pass
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+        if strict:
+            raise
 
 
 def hash_identifier(value: Any, *, bits: int = DEFAULT_IDENTIFIER_HASH_BITS) -> str:
@@ -303,11 +339,14 @@ def write_task_run_metadata(
     identifier_hash_bits: int,
     n_attributes_per_run: Optional[int],
     attribute_batches: Sequence[Sequence[Tuple[str, Any]]],
+    strict: bool = False,
+    **task_metadata: Any,
 ) -> None:
     attr_batches = metadata_attribute_batches(attribute_batches)
     update_run_metadata(
         save_dir,
         base_name,
+        strict=strict,
         task=task_name,
         output_base_name=base_name,
         model=model,
@@ -315,4 +354,5 @@ def write_task_run_metadata(
         n_attributes_per_run=n_attributes_per_run,
         attribute_count=sum(len(batch) for batch in attr_batches),
         attribute_batches=attr_batches,
+        **task_metadata,
     )

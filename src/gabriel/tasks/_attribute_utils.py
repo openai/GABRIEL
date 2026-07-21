@@ -11,14 +11,15 @@ def load_persisted_attributes(
     task_name: str,
     item_name: str = "attributes",
     legacy_filename: Optional[str] = None,
+    persist_missing: bool = True,
 ) -> Dict[str, Any]:
     """Load attributes/labels from disk for reproducibility.
 
     Preference order:
     1) ``attributes.json`` in ``save_dir``
     2) ``legacy_filename`` (e.g., ``ratings_attrs.json``) in ``save_dir``
-    When neither exists, ``incoming`` is written to both paths (when
-    applicable) for future runs.
+    When neither exists and ``persist_missing`` is true, ``incoming`` is
+    written to both paths (when applicable) for future runs.
     """
 
     primary_path = os.path.join(save_dir, "attributes.json")
@@ -57,13 +58,14 @@ def load_persisted_attributes(
         print(message)
         return loaded
 
-    for path in candidate_paths:
-        if not path:
-            continue
-        try:
-            with open(path, "w") as f:
-                json.dump(incoming, f, indent=2)
-        except Exception:
-            pass
+    if persist_missing:
+        for path in candidate_paths:
+            if not path:
+                continue
+            try:
+                with open(path, "w") as f:
+                    json.dump(incoming, f, indent=2)
+            except Exception:
+                pass
 
     return incoming

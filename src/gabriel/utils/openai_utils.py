@@ -4295,8 +4295,88 @@ async def get_all_responses(
             cols.insert(7, "Reasoning Summary")
         df = pd.DataFrame(columns=cols)
         done = set()
-    written_identifiers: Set[str] = set(df["Identifier"].astype(str)) if not df.empty else set()
+    # Successful checkpoint rows are immutable within this invocation. Failed
+    # rows must remain writable so a later successful retry can replace them.
+    written_identifiers: Set[str] = set(done)
     requested_identifiers = [str(i) for i in identifiers]
+
+    def _persist_response_rows(
+        batch_df: pd.DataFrame, *, atomic: bool = False
+    ) -> None:
+        """Persist new rows, replacing any previously failed identifiers."""
+
+        nonlocal df, csv_header_written, written_identifiers
+        if batch_df.empty:
+            return
+        if "Web Search Sources" not in batch_df.columns:
+            batch_df["Web Search Sources"] = pd.NA
+        batch_df = batch_df.drop_duplicates(subset=["Identifier"], keep="last")
+        batch_df = batch_df[
+            ~batch_df["Identifier"].astype(str).isin(written_identifiers)
+        ]
+        if batch_df.empty:
+            return
+
+        batch_identifiers = set(batch_df["Identifier"].astype(str))
+        existing_identifiers = (
+            set(df["Identifier"].astype(str)) if not df.empty else set()
+        )
+        replaces_failed_rows = bool(batch_identifiers & existing_identifiers)
+        if atomic or replaces_failed_rows:
+            merged = pd.concat([df, batch_df], ignore_index=True)
+            merged = merged.drop_duplicates(
+                subset=["Identifier"], keep="last"
+            ).reset_index(drop=True)
+            to_save = merged.copy()
+            for col in ("Response", "Error Log", "Web Search Sources"):
+                if col in to_save:
+                    to_save[col] = to_save[col].apply(_ser)
+            file_descriptor, temporary_path = tempfile.mkstemp(
+                prefix=f".{Path(save_path).name}.",
+                suffix=".tmp",
+                dir=str(save_dir),
+                text=True,
+            )
+            try:
+                with os.fdopen(
+                    file_descriptor,
+                    "w",
+                    encoding="utf-8",
+                    newline="",
+                ) as temporary_file:
+                    to_save.to_csv(
+                        temporary_file,
+                        index=False,
+                        quoting=csv.QUOTE_MINIMAL,
+                    )
+                    temporary_file.flush()
+                    os.fsync(temporary_file.fileno())
+                os.replace(temporary_path, save_path)
+            except Exception:
+                with contextlib.suppress(OSError):
+                    os.unlink(temporary_path)
+                raise
+            df = merged
+            csv_header_written = True
+        else:
+            to_save = batch_df.copy()
+            for col in ("Response", "Error Log", "Web Search Sources"):
+                if col in to_save:
+                    to_save[col] = to_save[col].apply(_ser)
+            to_save.to_csv(
+                save_path,
+                mode="a" if csv_header_written else "w",
+                header=not csv_header_written,
+                index=False,
+                quoting=csv.QUOTE_MINIMAL,
+            )
+            csv_header_written = True
+            if df.empty:
+                df = batch_df.reset_index(drop=True)
+            else:
+                df = pd.concat([df, batch_df], ignore_index=True)
+        written_identifiers.update(batch_identifiers)
+
     # Helper to calculate and report final run cost
     def _report_cost() -> None:
         nonlocal df
@@ -4607,34 +4687,35 @@ async def get_all_responses(
     if use_batch:
         state_path = save_path + ".batch_state.json"
 
+        def _write_batch_state(payload: Dict[str, Any]) -> None:
+            """Atomically persist every externally visible Batch transition."""
+
+            file_descriptor, temporary_path = tempfile.mkstemp(
+                prefix=f".{Path(state_path).name}.",
+                suffix=".tmp",
+                dir=str(save_dir),
+                text=True,
+            )
+            try:
+                with os.fdopen(
+                    file_descriptor, "w", encoding="utf-8"
+                ) as temporary_file:
+                    json.dump(payload, temporary_file)
+                    temporary_file.flush()
+                    os.fsync(temporary_file.fileno())
+                os.replace(temporary_path, state_path)
+            except Exception:
+                with contextlib.suppress(OSError):
+                    os.unlink(temporary_path)
+                raise
+
         # Helper to append batch rows
         def _append_results(rows: List[Dict[str, Any]]) -> None:
-            nonlocal df, csv_header_written, written_identifiers
             if not rows:
                 return
-            batch_df = pd.DataFrame(rows)
-            if "Web Search Sources" not in batch_df.columns:
-                batch_df["Web Search Sources"] = pd.NA
-            batch_df = batch_df[~batch_df["Identifier"].astype(str).isin(written_identifiers)]
-            if batch_df.empty:
-                return
-            to_save = batch_df.copy()
-            for col in ("Response", "Error Log", "Web Search Sources"):
-                if col in to_save:
-                    to_save[col] = to_save[col].apply(_ser)
-            to_save.to_csv(
-                save_path,
-                mode="a" if csv_header_written else "w",
-                header=not csv_header_written,
-                index=False,
-                quoting=csv.QUOTE_MINIMAL,
-            )
-            csv_header_written = True
-            if df.empty:
-                df = batch_df.reset_index(drop=True)
-            else:
-                df = pd.concat([df, batch_df], ignore_index=True)
-            written_identifiers.update(batch_df["Identifier"].astype(str))
+            # A batch ID is removed from state only after this atomic checkpoint
+            # succeeds, so a crash cannot lose already-paid response rows.
+            _persist_response_rows(pd.DataFrame(rows), atomic=True)
 
         client = _get_client(base_url)
         # Load existing state
@@ -4655,6 +4736,24 @@ async def get_all_responses(
                     }
                 ]
             }
+        if not isinstance(state.get("batches", []), list):
+            raise ValueError(f"Malformed Batch API state in {state_path!r}")
+        unresolved_submissions = [
+            batch_state
+            for batch_state in state.get("batches", [])
+            if not isinstance(batch_state, dict)
+            or (
+                batch_state.get("status") == "submitting"
+                or not batch_state.get("batch_id")
+            )
+        ]
+        if unresolved_submissions:
+            raise RuntimeError(
+                "Found an unresolved Batch API submission intent. The server "
+                "may already have accepted a paid job, so automatic resubmission "
+                "is disabled. Reconcile or cancel the external batch, then "
+                "remove/reset the local state only when safe."
+            )
         # Cancel unfinished batches if requested
         if cancel_existing_batch and state.get("batches"):
             logger.info("Cancelling unfinished batch jobs...")
@@ -4798,29 +4897,33 @@ async def get_all_responses(
                     uploaded = await client.files.create(
                         file=open(input_filename, "rb"), purpose="batch"
                     )
+                    pending_batch: Dict[str, Any] = {
+                        "batch_id": None,
+                        "status": "submitting",
+                        "input_file_id": uploaded.id,
+                        "total": len(batch_tasks),
+                        "submitted_at": int(time.time()),
+                    }
+                    state["batches"].append(pending_batch)
+                    # Record intent before the irreversible external call. A
+                    # connection loss after server acceptance is ambiguous and
+                    # must fail closed rather than submit the same work again.
+                    _write_batch_state(state)
                     batch = await client.batches.create(
                         input_file_id=uploaded.id,
                         endpoint="/v1/responses",
                         completion_window=batch_completion_window,
                     )
-                    state["batches"].append(
-                        {
-                            "batch_id": batch.id,
-                            "input_file_id": uploaded.id,
-                            "total": len(batch_tasks),
-                            "submitted_at": int(time.time()),
-                        }
-                    )
+                    pending_batch["batch_id"] = batch.id
+                    pending_batch["status"] = "submitted"
+                    _write_batch_state(state)
                     logger.info(
                         f"Submitted batch {batch.id} with {len(batch_tasks)} requests."
                     )
-                with open(state_path, "w") as f:
-                    json.dump(state, f)
         # Return immediately if not waiting for completion
         if not batch_wait_for_completion:
             return df
         unfinished_batches: List[Dict[str, Any]] = list(state.get("batches", []))
-        completed_rows: List[Dict[str, Any]] = []
         while unfinished_batches:
             for b in list(unfinished_batches):
                 bid = b.get("batch_id")
@@ -4831,6 +4934,7 @@ async def get_all_responses(
                     continue
                 status = job.status
                 if status == "completed":
+                    batch_completed_rows: List[Dict[str, Any]] = []
                     output_file_id = job.output_file_id
                     error_file_id = job.error_file_id
                     logger.info(f"Batch {bid} completed. Downloading results...")
@@ -4928,7 +5032,7 @@ async def get_all_responses(
                             }
                             if reasoning_summary is not None:
                                 row["Reasoning Summary"] = None
-                            completed_rows.append(row)
+                            batch_completed_rows.append(row)
                             continue
                         resp_obj = rec["response"]
                         resp_text: Optional[str] = None
@@ -5041,15 +5145,15 @@ async def get_all_responses(
                         }
                         if reasoning_summary is not None:
                             row["Reasoning Summary"] = summary_text
-                        completed_rows.append(row)
+                        batch_completed_rows.append(row)
+                    _append_results(batch_completed_rows)
                     unfinished_batches.remove(b)
                     state["batches"] = [
                         bb
                         for bb in state.get("batches", [])
                         if bb.get("batch_id") != bid
                     ]
-                    with open(state_path, "w") as f:
-                        json.dump(state, f)
+                    _write_batch_state(state)
                 elif status in {"failed", "cancelled", "expired"}:
                     logger.warning(f"Batch {bid} finished with status {status}.")
                     unfinished_batches.remove(b)
@@ -5058,8 +5162,7 @@ async def get_all_responses(
                         for bb in state.get("batches", [])
                         if bb.get("batch_id") != bid
                     ]
-                    with open(state_path, "w") as f:
-                        json.dump(state, f)
+                    _write_batch_state(state)
                 else:
                     rc = job.request_counts
                     logger.info(
@@ -5067,8 +5170,8 @@ async def get_all_responses(
                     )
             if unfinished_batches:
                 await asyncio.sleep(batch_poll_interval)
-        # Append and return
-        _append_results(completed_rows)
+        # All completed rows were durably checkpointed before their batch IDs
+        # were removed from state.
         _report_cost()
         return df
     # Non‑batch path
@@ -5716,30 +5819,9 @@ async def get_all_responses(
             _maybe_refresh_estimates("parallel-cap reached", force=True)
 
     async def flush() -> None:
-        nonlocal results, df, processed, csv_header_written, written_identifiers
+        nonlocal results, processed
         if results:
-            batch_df = pd.DataFrame(results)
-            if "Web Search Sources" not in batch_df.columns:
-                batch_df["Web Search Sources"] = pd.NA
-            batch_df = batch_df[~batch_df["Identifier"].astype(str).isin(written_identifiers)]
-            if not batch_df.empty:
-                to_save = batch_df.copy()
-                for col in ("Response", "Error Log", "Web Search Sources"):
-                    if col in to_save:
-                        to_save[col] = to_save[col].apply(_ser)
-                to_save.to_csv(
-                    save_path,
-                    mode="a" if csv_header_written else "w",
-                    header=not csv_header_written,
-                    index=False,
-                    quoting=csv.QUOTE_MINIMAL,
-                )
-                csv_header_written = True
-                if df.empty:
-                    df = batch_df.reset_index(drop=True)
-                else:
-                    df = pd.concat([df, batch_df], ignore_index=True)
-                written_identifiers.update(batch_df["Identifier"].astype(str))
+            _persist_response_rows(pd.DataFrame(results))
             results = []
         if logger.isEnabledFor(logging.INFO) and processed:
             logger.info(

@@ -37,7 +37,7 @@ Read our blog post [here](https://openai.com/index/scaling-social-science-resear
 Most of the evidence social scientists and analysts care about lives in unstructured formats: interviews, speeches, transcripts, product photos, archival scans. Modern GPT models can judge attributes, extract facts, and reason about this material with high fidelity, but building robust pipelines is still tedious. GABRIEL provides:
 
 - 🧠 **Human-level comprehension on demand** – express the attribute the way you would brief a human coder; GABRIEL packages the prompt, context, and retries for you.
-- 📊 **Quantitative outputs** – ratings (0–100), grounded comparisons, classifications, and structured extractions return as tidy DataFrames with reproducible settings.
+- 📊 **Quantitative outputs** – ratings (0–100), pairwise comparisons, classifications, and structured extractions return as tidy DataFrames with reproducible settings.
 - ⚙️ **Operational tooling** – automatic parallelism (hundreds of concurrent calls), resumable runs, raw response logs, and helper UIs make it safe to scale to very large corpora.
 - 🧰 **Extensibility** – swap instructions with `additional_instructions`, bring your own templates, or drop down to `gabriel.whatever` + custom `response_fn` for bespoke prompts while still reusing the infrastructure.
 
@@ -50,7 +50,7 @@ The tutorial notebook walks through these ideas step-by-step—from setting up a
 | Function | Purpose & Output Scale | Example Use |
 | --- | --- | --- |
 | `gabriel.rate` | Asks GPT to score each text / image / audio / item on natural language attributes. Output = 0-100 rating. | Measure “populist rhetoric” in a speech; “toxicity” of tweets; “luxury” in ad images. |
-| `gabriel.rank` | Pairwise comparisons between texts yields ELO-like attribute ratings. Output = grounded, relative z scores for each text. | Rank technologies by “bulkiness” or artworks by “fine brushwork”. |
+| `gabriel.rank` | Pairwise comparisons yield Bradley–Terry attribute ratings. Output = model-derived z-scores standardized within connected comparison components. | Rank technologies by “bulkiness” or artworks by “fine brushwork”. |
 | `gabriel.classify` | Classifies texts / images / audio / items on whether provided labels apply. Output = one or more classes per item. | Tag news articles, product photos, or interview clips into topical categories. |
 | `gabriel.extract` | Structured fact or entity extraction. One source can return one row or expand into several extracted-entity rows. | Extract every product and its name, price, description, and color from each catalog page. |
 | `gabriel.discover` | Discovers natural language features which discriminate two classes of data. | Identify what distinguishes 5 star vs. 1 star reviews or successful vs. failed startups. |
@@ -73,7 +73,7 @@ The tutorial notebook walks through these ideas step-by-step—from setting up a
 | `gabriel.bucket` | Proposes a compact taxonomy from many terms. Output = bucket names and definitions, not row-level assignments. | Develop candidate categories for technologies, artworks, or HR complaints, then review and apply them downstream. |
 | `gabriel.seed` | Enforces a representative distribution / diversity of seeds. | Initialize unique personas that match US population distribution. |
 | `gabriel.poll` | Seeds personas, expands them into full biographies, and surveys them. | Simulate a synthetic opinion poll on policy, values, and open-ended attitudes. |
-| `gabriel.ideate` | Generates many novel scientific theories and filters the cream of the crop. | Procure novel theories on inflation for potential research. |
+| `gabriel.ideate` | Generates and filters candidate scientific theories for further evaluation. | Procure novel theories on inflation for potential research. |
 | `gabriel.debias` | Post-process measurements to remove inference bias. | Ensure GPT isn't guessing climate opinions in speeches based on general political lean. |
 | `gabriel.load` | Prepares a folder of text / image / audio files into a spreadsheet for use in GABRIEL. | Image directory converted into spreadsheet of file paths. |
 | `gabriel.view` | UI to view sample texts with ratings / passage coding. | Spot-check classify / rating outputs; view coded passages. |
@@ -183,7 +183,7 @@ The tutorial notebook covers full projects end-to-end. The list below matches it
 
 ### Measurement primitives
 - **`gabriel.rate`** – assign 0–100 scores per attribute across text, entities, images, audio, or web-sourced context.
-- **`gabriel.rank`** – pairwise tournaments that surface relative winners with grounded z-scores.
+- **`gabriel.rank`** – pairwise tournaments fitted with a Bradley–Terry model, with symmetric pseudo-comparison regularization on observed edges when `learning_rate > 0`; a zero value requires Ford's directed strong-connectivity condition within each nontrivial observed component for a finite fit. Draws are encoded as half-wins in a binary Bradley–Terry working objective (one comparison total), not as a three-outcome tie likelihood. `insufficient_signal_policy="tie"` makes the modeling assumption that missing direct evidence is equality; use `"abstain"` to condition fitting on retained judgments, noting that informative abstention can still bias estimates. In non-recursive runs, z-scores are standardized separately within connected comparison components (with a neutral zero fallback when a component has no score dispersion), and `_component` columns identify which values are mutually comparable; isolated items remain unranked with `NaN` scores and standard errors. `<attribute>_se` is an asymptotic, model-based sandwich standard error for the component-centered raw log-skill `<attribute>_raw`, computed while treating the realized comparison graph as fixed. Observed comparison weights determine the meat under the binary-BT working variance, while fixed pseudo-comparisons add curvature to the bread. The standard error excludes shrinkage bias, shared-judge dependence, misspecification, adaptive-selection uncertainty, and uncertainty for the reported z-score. A non-recursive `<file_name>_diagnostics.csv` sidecar records decoded outcome counts, effective comparison weight, graph components, isolates, and the count of finite standard errors. Resume metadata fingerprints the effective judge settings and input payloads; `judge_version` is required for custom judges and must change whenever their hidden logic changes. Planned rounds and Batch jobs are recovered transactionally rather than silently mixed or resubmitted.
 - **`gabriel.classify`** – single- or multi-label tagging with label definitions and consensus columns.
 - **`gabriel.extract`** – extract typed fields or multiple entities from each passage, page, image, PDF, or audio item; one source may intentionally produce several rows.
 - **`gabriel.discover`** – contrast two labeled corpora to learn discriminating features.

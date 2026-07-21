@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import inspect
+import json
 import warnings
 import pandas as pd
 from dataclasses import fields
@@ -917,7 +918,7 @@ async def ideate(
     embedding_fn: Optional[Callable[..., Awaitable[Any]]] = None,
     get_all_embeddings_fn: Optional[Callable[..., Awaitable[Dict[str, List[float]]]]] = None,
 ) -> pd.DataFrame:
-    """Generates many novel scientific theories and filters the cream of the crop.
+    """Generate and filter candidate scientific theories for further evaluation.
 
     Example Use
     -----------
@@ -1196,6 +1197,7 @@ async def rank(
     power_matching: bool = True,
     return_raw_scores: bool = False,
     learning_rate: float = 0.1,
+    insufficient_signal_policy: str = "tie",
     n_parallels: int = 650,
     n_attributes_per_run: Optional[int] = None,
     file_name: str = "rankings",
@@ -1219,12 +1221,13 @@ async def rank(
     primer_scores: Optional[Dict[str, Dict[str, float]]] = None,
     primer_scale: float = 1.0,
     primer_center: bool = True,
+    judge_version: Optional[str] = None,
     id_column: Optional[str] = None,
     response_fn: Optional[Callable[..., Awaitable[Any]]] = None,
     get_all_responses_fn: Optional[Callable[..., Awaitable[pd.DataFrame]]] = None,
     **cfg_kwargs,
 ) -> pd.DataFrame:
-    """Pairwise comparisons between texts yields ELO-like attribute ratings. Output = grounded, relative z scores for each text.
+    """Fit model-derived Bradley–Terry ratings from pairwise comparisons.
 
     Example Use
     -----------
@@ -1249,7 +1252,30 @@ async def rank(
         when this package version shipped; model IDs change, so verify the exact
         slug in the official OpenAI model catalog before overriding it.
     n_rounds, matches_per_round, power_matching, learning_rate:
-        Parameters controlling the Elo-style tournament mechanics.
+        Parameters controlling the Bradley–Terry tournament mechanics.
+        ``matches_per_round`` is a per-item target capped at the number of
+        possible opponents. Realized degrees may exceed it because an item can
+        also be selected as another item's opponent; this is especially common
+        in random mode. ``power_matching=True`` uses an uncertainty-guided
+        heuristic, not exact expected information gain; ``False`` uses random
+        pairing. ``learning_rate`` is the total symmetric pseudo-comparison
+        weight applied to each observed pair. A zero value requires Ford's
+        directed strong-connectivity condition within every nontrivial observed
+        component for a finite maximum-likelihood fit.
+        ``<attribute>_se`` is an asymptotic, model-based sandwich standard error
+        for the component-centered raw log-skill, computed while treating the
+        realized comparison graph as fixed. Observed comparison weights
+        determine the meat under binary-BT working variance; positive fixed
+        pseudo-comparison weight adds curvature to the bread. It excludes
+        shrinkage bias, shared-judge dependence, misspecification,
+        adaptive-selection uncertainty, and uncertainty for the reported
+        z-score.
+    insufficient_signal_policy:
+        ``"tie"`` makes the modeling assumption that lack of direct signal is
+        equality and gives each item a half-win. ``"abstain"`` excludes that
+        judgment from fitting; informative abstention can still bias the
+        retained sample. True draws use half-wins in a binary Bradley–Terry
+        working objective, not a three-outcome tie likelihood.
     n_parallels:
         Concurrency ceiling, not a fixed worker count. Keep the default unchanged:
         GABRIEL ramps up and adapts to rate limits and repeated errors. Temporary
@@ -1273,16 +1299,22 @@ async def rank(
         Settings for recursive pruning (fraction kept, minimum remaining, etc.).
     initial_rating_pass:
         Whether to run a preliminary rating stage before comparisons. Enabled by
-        default to give the tournament grounded starting scores; set to
+        default to give the tournament model-derived starting scores; set to
         ``False`` to skip the rating seed.
     rate_kwargs:
         Additional configuration forwarded to the preliminary rating stage.
         A legacy ``max_output_tokens`` entry is accepted, warned about, and
-        ignored.
+        ignored. ``attributes``, ``save_dir``, and ``file_name`` are owned by
+        Rank and cannot be overridden here.
     primer_scores, primer_scale, primer_center:
         Optional seed ratings to prime the Bradley–Terry loop. Scores are
         centred per attribute when ``primer_center`` is ``True`` and scaled
         by ``primer_scale``.
+    judge_version:
+        Stable label required when ``response_fn`` or
+        ``get_all_responses_fn`` supplies a custom judge. Change it whenever
+        hidden judgment logic or configuration changes so resumed tournaments
+        reject mixed measurement regimes.
     id_column:
         Optional existing identifier column; otherwise hashes of ``column_name``
         are generated.
@@ -1300,12 +1332,86 @@ async def rank(
     Returns
     -------
     pandas.DataFrame
-        Ranked outputs. The CSV written to ``save_dir`` always contains raw
-        scores and standard errors, but the returned DataFrame hides those
-        columns unless ``return_raw_scores`` is ``True``.
+        Ranked outputs. For non-recursive runs, the CSV written to ``save_dir``
+        contains raw scores, model-based sandwich standard errors, and
+        comparison-graph component labels. Z-scores and raw scores are only
+        comparable within a component; components with no score dispersion use
+        a neutral z-score fallback of zero, while isolated items have ``NaN``
+        scores and standard errors. Raw scores and standard errors are hidden unless
+        ``return_raw_scores`` is ``True``. Recursive runs instead return
+        stage-relative z-scores, ``exit_stage``, and ``overall_rank``. At
+        Rank-produced recursive stages, pruning stops with an error if the cut
+        attribute's comparison graph is disconnected; a preliminary Rate stage
+        has no comparison graph. Non-recursive runs also save a diagnostics sidecar with
+        outcome counts, effective comparison weight, graph topology, and the
+        count of finite standard errors.
     """
     save_dir = os.path.expandvars(os.path.expanduser(save_dir))
     os.makedirs(save_dir, exist_ok=True)
+
+    def _persisted_rank_attribute_keys() -> Optional[List[str]]:
+        base_name = os.path.splitext(file_name)[0]
+        for path in (
+            Path(save_dir) / f"{base_name}_attrs.json",
+            Path(save_dir) / "attributes.json",
+        ):
+            try:
+                with path.open(encoding="utf-8") as attribute_file:
+                    payload = json.load(attribute_file)
+            except Exception:
+                continue
+            if isinstance(payload, dict) and all(
+                isinstance(key, str) for key in payload
+            ):
+                return list(payload)
+            if isinstance(payload, list) and all(
+                isinstance(key, str) for key in payload
+            ):
+                return payload
+        return None
+
+    def _project_public_rank_columns(result: pd.DataFrame) -> pd.DataFrame:
+        if return_raw_scores or recursive:
+            return result
+        # Infer persisted Rank attributes from the output schema rather than
+        # from this invocation's arguments.  Cached results may have been
+        # produced with a different in-memory attribute object, but the public
+        # projection must never leak hidden raw estimates or standard errors.
+        schema_attr_keys = [
+            column[: -len("_component")]
+            for column in result.columns
+            if column.endswith("_component")
+            and column[: -len("_component")] in result.columns
+            and f"{column[: -len('_component')]}_raw" in result.columns
+            and f"{column[: -len('_component')]}_se" in result.columns
+        ]
+        caller_attr_keys = (
+            list(attributes.keys())
+            if isinstance(attributes, dict)
+            else list(attributes)
+        )
+        persisted_attr_keys = _persisted_rank_attribute_keys()
+        # Persisted attributes are authoritative and avoid hiding unrelated
+        # input columns that happen to share Rank's suffix convention. Caller
+        # and schema inference retain safe behavior for legacy cache layouts.
+        persisted_matches = [
+            attr
+            for attr in (persisted_attr_keys or [])
+            if f"{attr}_raw" in result.columns and f"{attr}_se" in result.columns
+        ]
+        attr_keys = (
+            persisted_matches
+            if persisted_matches
+            else list(dict.fromkeys([*schema_attr_keys, *caller_attr_keys]))
+        )
+        drop_cols = [
+            column
+            for attr in attr_keys
+            for column in (f"{attr}_raw", f"{attr}_se")
+            if column in result.columns
+        ]
+        return result.drop(columns=drop_cols) if drop_cols else result
+
     if df is None:
         if recursive:
             base_folder = os.path.join(save_dir, f"{file_name}_recursive")
@@ -1313,7 +1419,9 @@ async def rank(
         else:
             base_name = os.path.splitext(file_name)[0]
             final_path = os.path.join(save_dir, f"{base_name}_final.csv")
-        return _load_cached_dataframe(final_path, task_name="Rank")
+        return _project_public_rank_columns(
+            _load_cached_dataframe(final_path, task_name="Rank")
+        )
     cfg_kwargs, response_kwargs = _split_cfg_and_response_kwargs(
         RankConfig,
         dict(cfg_kwargs),
@@ -1327,6 +1435,7 @@ async def rank(
         matches_per_round=matches_per_round,
         power_matching=power_matching,
         learning_rate=learning_rate,
+        insufficient_signal_policy=insufficient_signal_policy,
         model=model,
         n_parallels=n_parallels,
         n_attributes_per_run=n_attributes_per_run,
@@ -1351,6 +1460,7 @@ async def rank(
         primer_scores=primer_scores,
         primer_scale=primer_scale,
         primer_center=primer_center,
+        judge_version=judge_version,
         **cfg_kwargs,
     )
     result_df = await Rank(cfg, template_path=template_path).run(
@@ -1363,26 +1473,9 @@ async def rank(
         **response_kwargs,
     )
 
-    # By default only expose the z-score columns (attribute names without suffixes)
-    # to API callers while keeping the raw/SE columns persisted in the CSV output.
-    if return_raw_scores:
-        return result_df
-
-    if isinstance(attributes, dict):
-        attr_keys: List[str] = list(attributes.keys())
-    else:
-        attr_keys = list(attributes)
-    drop_cols: List[str] = []
-    for attr in attr_keys:
-        raw_col = f"{attr}_raw"
-        se_col = f"{attr}_se"
-        if raw_col in result_df.columns:
-            drop_cols.append(raw_col)
-        if se_col in result_df.columns:
-            drop_cols.append(se_col)
-    if drop_cols:
-        result_df = result_df.drop(columns=drop_cols)
-    return result_df
+    # Keep raw estimates and uncertainty persisted while presenting the same
+    # public projection for freshly computed and cached results.
+    return _project_public_rank_columns(result_df)
 
 
 async def codify(

@@ -93,3 +93,36 @@ def test_save_dataframe_with_fallback_removes_stale_split_parts_on_primary_succe
     assert saved_paths == [str(target)]
     assert target.exists()
     assert not stale_part.exists()
+
+
+def test_relative_primary_save_removes_stale_parts(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    stale = Path("final_1.csv")
+    stale.write_text("value\nold\n")
+    unrelated = Path("other_1.csv")
+    unrelated.write_text("value\nkeep\n")
+
+    saved = save_dataframe_with_fallback(pd.DataFrame({"value": [1]}), "final.csv")
+
+    assert saved == ["final.csv"]
+    assert not stale.exists()
+    assert unrelated.read_text() == "value\nkeep\n"
+
+
+def test_relative_split_save_removes_stale_tail(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    Path("final_1.csv").write_text("value\nold\n")
+    Path("final_2.csv").write_text("value\nold-tail\n")
+    original_to_csv = pd.DataFrame.to_csv
+
+    def fail_primary(self, path_or_buf=None, *args, **kwargs):
+        if str(path_or_buf) == "final.csv":
+            raise OSError("primary write failed")
+        return original_to_csv(self, path_or_buf, *args, **kwargs)
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", fail_primary)
+    saved = save_dataframe_with_fallback(pd.DataFrame({"value": [1]}), "final.csv")
+
+    assert saved == ["final_1.csv"]
+    assert pd.read_csv("final_1.csv")["value"].tolist() == [1]
+    assert not Path("final_2.csv").exists()

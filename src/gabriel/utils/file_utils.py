@@ -63,12 +63,12 @@ def _find_split_csv_parts(path: str) -> List[str]:
     """Return sorted split CSV parts matching ``<stem>_<n><suffix>``."""
 
     target = os.path.expandvars(os.path.expanduser(path))
-    base_dir = os.path.dirname(target)
+    base_dir = os.path.dirname(target) or "."
     stem = os.path.splitext(os.path.basename(target))[0]
     suffix = os.path.splitext(target)[1] or ".csv"
     pattern = re.compile(rf"^{re.escape(stem)}_(\d+){re.escape(suffix)}$")
     matches: List[tuple[int, str]] = []
-    if not base_dir or not os.path.isdir(base_dir):
+    if not os.path.isdir(base_dir):
         return []
     for name in os.listdir(base_dir):
         match = pattern.match(name)

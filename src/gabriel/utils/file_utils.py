@@ -136,12 +136,14 @@ def save_dataframe_with_fallback(
     due to very large output files), it retries by splitting the DataFrame into
     numbered parts using dynamic row chunk sizes. By default it attempts 100k
     rows per file and then 10k rows per file.
+    Any file left at the primary path after a failed write is removed only after
+    a complete split save succeeds, so cache loads can use the split files.
 
     Returns
     -------
     list[str]
-        Paths that were successfully written. An empty list indicates all save
-        attempts failed.
+        Paths that were successfully written. An empty list indicates that
+        saving failed or a failed primary file could not be removed.
     """
 
     resolved_path = os.path.expandvars(os.path.expanduser(path))
@@ -199,6 +201,22 @@ def save_dataframe_with_fallback(
                 exc_info=split_exc,
             )
             continue
+
+        try:
+            os.remove(resolved_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            print(
+                f"{prefix}Split files were saved, but could not remove the primary CSV "
+                f"at {resolved_path}. Remove it before reloading cached results."
+            )
+            logger.warning(
+                "Could not remove failed primary CSV %s; it may hide the split files.",
+                resolved_path,
+                exc_info=True,
+            )
+            return []
 
         print(
             f"{prefix}Saved fallback split files ({part_count} part(s)) with base path "

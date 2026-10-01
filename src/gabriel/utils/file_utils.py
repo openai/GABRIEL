@@ -239,8 +239,8 @@ def load(
     ----------
     folder_path:
         Path to a directory containing media files or to a single file. When a
-        CSV/Excel file is provided, it is loaded directly without creating a
-        copy.
+        CSV, TSV, Excel, Parquet, or Feather table is provided in a textual
+        modality, it is loaded directly without creating a copy.
     extensions:
         Optional iterable of file extensions (without leading dots) to include.
         When ``None`` all files are processed.
@@ -257,6 +257,8 @@ def load(
     reset_files:
         When ``False`` (default), an existing file at ``save_path`` is reused
         instead of being regenerated. Set to ``True`` to overwrite the file.
+        Direct tabular inputs in a textual modality are always read from the
+        requested file, regardless of this aggregate cache.
     modality:
         Optional modality hint. ``"text"``, ``"entity"``, and ``"web"`` are
         treated as text; ``"image"``, ``"audio"``, and ``"pdf"`` collect file paths. When
@@ -272,7 +274,12 @@ def load(
     target_dir = _resolve_save_directory(folder_path, save_dir)
     save_path = os.path.join(target_dir, save_name)
 
-    if os.path.exists(save_path) and not reset_files:
+    direct_table_input = (
+        os.path.isfile(folder_path)
+        and os.path.splitext(folder_path)[1].lower() in TABULAR_EXTENSIONS
+        and (modality is None or _is_textual_modality(modality.lower()))
+    )
+    if os.path.exists(save_path) and not reset_files and not direct_table_input:
         logger.info("Loading existing aggregated file from %s", save_path)
         df = _read_tabular_file(save_path)
         print(df.head())

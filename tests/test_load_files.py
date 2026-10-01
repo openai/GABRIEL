@@ -49,6 +49,69 @@ def test_load_csv_direct(tmp_path):
     assert not os.path.exists(tmp_path / "copy.csv")
 
 
+@pytest.mark.parametrize("suffix", ["csv", "tsv", "xlsx", "parquet", "pq", "feather"])
+def test_load_direct_table_ignores_aggregate_cache(tmp_path, suffix):
+    expected = pd.DataFrame({"record_id": [10, 20], "label": ["wanted", "also wanted"]})
+    source = tmp_path / f"requested.{suffix}"
+    if suffix == "csv":
+        expected.to_csv(source, index=False)
+    elif suffix == "tsv":
+        expected.to_csv(source, sep="\t", index=False)
+    elif suffix == "xlsx":
+        pytest.importorskip("openpyxl")
+        expected.to_excel(source, index=False)
+    elif suffix in {"parquet", "pq"}:
+        pytest.importorskip("pyarrow")
+        expected.to_parquet(source, index=False)
+    else:
+        pytest.importorskip("pyarrow")
+        expected.to_feather(source)
+    cache = tmp_path / "gabriel_aggregated_content.csv"
+    cache.write_text("unrelated\nSTALE\n")
+    original_source = source.read_bytes()
+    original_cache = cache.read_bytes()
+
+    pd.testing.assert_frame_equal(load(str(source)), expected)
+    assert source.read_bytes() == original_source
+    assert cache.read_bytes() == original_cache
+
+
+@pytest.mark.parametrize("modality", [None, "text", "entity", "web", "TEXT"])
+def test_load_direct_table_ignores_custom_save_cache(tmp_path, modality):
+    source = tmp_path / "requested.CSV"
+    source.write_text("record_id\n42\n")
+    output = tmp_path / "output"
+    output.mkdir()
+    cache = output / "custom.csv"
+    cache.write_text("wrong\n99\n")
+
+    result = load(str(source), save_dir=str(output), save_name="custom.csv", modality=modality)
+
+    assert result.to_dict("list") == {"record_id": [42]}
+    assert cache.read_text() == "wrong\n99\n"
+
+
+def test_load_direct_table_without_cache_does_not_create_copy(tmp_path):
+    source = tmp_path / "requested.csv"
+    source.write_text("record_id\n42\n")
+
+    assert load(str(source)).to_dict("list") == {"record_id": [42]}
+    assert not (tmp_path / "gabriel_aggregated_content.csv").exists()
+
+
+@pytest.mark.parametrize("modality", ["image", "audio", "pdf"])
+def test_load_direct_table_preserves_path_modality_cache(tmp_path, modality):
+    source = tmp_path / "requested.csv"
+    source.write_text("record_id\n42\n")
+    # A prior tagged load leaves a distinguishable cache. Rebuilding without
+    # tag_dict would omit the tag column, so equality proves cache reuse.
+    expected = load(
+        str(source), modality=modality, tag_dict={"requested": 7}, reset_files=True
+    )
+
+    pd.testing.assert_frame_equal(load(str(source), modality=modality), expected)
+
+
 def test_load_modality_paths(tmp_path):
     base = tmp_path / "media"
     base.mkdir()

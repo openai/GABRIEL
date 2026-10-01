@@ -205,6 +205,8 @@ documents and media. These are common patterns, not restrictions:
 - CSV, TSV, Excel, Parquet, and Feather tables can be loaded directly.
   `gabriel.load(...)` can also construct a DataFrame from folders of text,
   images, audio, or PDFs while retaining filenames and directory layers.
+  For a table file with no modality or a text, entity, or web modality,
+  `gabriel.load(...)` reads that file rather than an aggregate cache.
 - Direct PDF modality preserves layout, figures, and images. Text extraction
   may be preferable when only words matter or when text from several file types
   should share one run. Images and audio can be analyzed directly rather than

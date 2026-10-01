@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import pandas as pd
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.S)
+_JSON_COMMENT_RE = re.compile(r'"(?:\\.|[^"\\])*"|//[^\r\n]*|/\*.*?\*/', re.S)
 
 # model used when an LLM is required to reformat malformed JSON
 JSON_LLM_MODEL = os.getenv("JSON_LLM_MODEL", "gpt-5.6-terra")
@@ -51,8 +52,11 @@ def _parse_json(txt: Any) -> Union[dict, list]:
 
     # attempt to strip `//` and `/* */` style comments before parsing
     try:
-        no_line_comments = re.sub(r"(?<!:)//.*$", "", cleaned, flags=re.MULTILINE)
-        no_comments = re.sub(r"/\*.*?\*/", "", no_line_comments, flags=re.S)
+        # Match quoted strings first so comment markers in values remain intact.
+        no_comments = _JSON_COMMENT_RE.sub(
+            lambda match: match.group(0) if match.group(0).startswith('"') else " ",
+            cleaned,
+        )
         out = json.loads(no_comments)
         if isinstance(out, (dict, list)):
             return out

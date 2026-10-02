@@ -265,7 +265,8 @@ def load(
     Returns
     -------
     DataFrame
-        The aggregated contents or file paths of the processed files.
+        The aggregated contents or file paths of the processed files. Empty
+        results retain the columns for the selected modality.
     """
 
     folder_path = os.path.expanduser(os.path.expandvars(folder_path))
@@ -406,7 +407,9 @@ def load(
         cols.append("text")
     else:
         df.drop(columns=["text"], inplace=True, errors="ignore")
-    if not df.empty:
+    if df.empty:
+        df = pd.DataFrame(columns=cols)
+    else:
         df = df[cols]
     df.to_csv(save_path, index=False)
     print(df.head())

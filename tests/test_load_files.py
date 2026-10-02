@@ -40,6 +40,38 @@ def test_load_existing_file_reuse(tmp_path):
     assert df.loc[0, "text"] == "a"
 
 
+@pytest.mark.parametrize(
+    "filename,load_kwargs,expected_columns",
+    [
+        (None, {}, ["name", "path", "text"]),
+        (
+            "notes.txt",
+            {"modality": "text", "extensions": ["md"]},
+            ["name", "path", "text"],
+        ),
+        (
+            "notes.txt",
+            {"modality": "image", "tag_dict": {"notes": "document"}},
+            ["name", "path", "tag"],
+        ),
+    ],
+    ids=["empty-directory", "extension-filter", "modality-filter-with-tags"],
+)
+def test_load_empty_result_keeps_columns_and_reloads(
+    tmp_path, filename, load_kwargs, expected_columns
+):
+    if filename is not None:
+        (tmp_path / filename).write_text("no matching files")
+
+    fresh = load(str(tmp_path), **load_kwargs)
+    cached = load(str(tmp_path), **load_kwargs)
+
+    assert fresh.empty
+    assert list(fresh.columns) == expected_columns
+    assert cached.empty
+    assert list(cached.columns) == expected_columns
+
+
 def test_load_csv_direct(tmp_path):
     df_in = pd.DataFrame({"a": [1, 2]})
     csv_path = tmp_path / "input.csv"

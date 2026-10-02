@@ -31,7 +31,6 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib as mpl
-import matplotlib.cm as cm
 from matplotlib.collections import LineCollection
 from scipy.stats import sem, norm
 
@@ -1333,7 +1332,7 @@ def regression_plot(
                 fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
                 ax.errorbar(xm, ym, yerr=yerr, fmt="o", color="black",
                             ecolor="black", capsize=3, markersize=6)
-                colours = mpl.cm.get_cmap(cmap)(np.linspace(0, 1, len(xm)))
+                colours = plt.get_cmap(cmap)(np.linspace(0, 1, len(xm)))
                 ax.scatter(xm, ym, c=colours, s=50, zorder=3)
                 title = f"{y_disp} vs. {x_disp}"
                 ax.set_title(textwrap.fill(title, wrap_width))
@@ -2271,7 +2270,7 @@ def bar_plot(
         indices = np.arange(chunk_count, dtype=float)
         bar_containers: List[mpl.container.BarContainer] = []
         if n_series == 1:
-            colours = plt.cm.get_cmap(cmap)(np.linspace(gradient_start, gradient_end, chunk_count))
+            colours = plt.get_cmap(cmap)(np.linspace(gradient_start, gradient_end, chunk_count))
             values_slice = chunk_values[:, 0]
             if orientation == "vertical":
                 container = ax.bar(
@@ -2296,7 +2295,7 @@ def bar_plot(
                 )
                 bar_containers.append(container)
         else:
-            cmap_obj = plt.cm.get_cmap(cmap)
+            cmap_obj = plt.get_cmap(cmap)
             series_colours = cmap_obj(np.linspace(gradient_start, gradient_end, n_series))
             if orientation == "vertical":
                 group_width = vertical_bar_width
@@ -2574,13 +2573,16 @@ def box_plot(
 
     bp = ax.boxplot(
         value_arrays,
-        labels=[textwrap.fill(str(label), wrap_width) for label in labels_list],
         patch_artist=True,
         notch=notch,
         showfliers=showfliers,
     )
+    ax.set_xticks(
+        range(1, len(labels_list) + 1),
+        labels=[textwrap.fill(str(label), wrap_width) for label in labels_list],
+    )
 
-    cmap_obj = cm.get_cmap(cmap)
+    cmap_obj = plt.get_cmap(cmap)
     colours = cmap_obj(np.linspace(gradient_start, gradient_end, len(value_arrays)))
     for patch, colour in zip(bp["boxes"], colours):
         patch.set_facecolor(colour)
@@ -2874,7 +2876,7 @@ def line_plot(
         if color_map and s in color_map:
             return color_map[s]
         # fall back to palette families by index
-        cmap = cm.get_cmap(cmap_names[idx % len(cmap_names)])
+        cmap = plt.get_cmap(cmap_names[idx % len(cmap_names)])
         return cmap(0.6)
 
     figs_axes = []
@@ -2927,7 +2929,7 @@ def line_plot(
                     cols[:, -1] = alphas
                 else:
                     # use colormap-driven gradient
-                    cmap = cm.get_cmap(cmap_names[idx % len(cmap_names)])
+                    cmap = plt.get_cmap(cmap_names[idx % len(cmap_names)])
                     if gradient_mode == 'value' and len(y_s) > 1:
                         ymin, ymax = np.nanmin(y_s), np.nanmax(y_s)
                         denom = max((ymax - ymin), 1e-12)

@@ -7,9 +7,11 @@ matplotlib = pytest.importorskip("matplotlib")
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
+from matplotlib.colors import ListedColormap
 
-from gabriel.utils.plot_utils import bar_plot, line_plot
+from gabriel.utils.plot_utils import bar_plot, box_plot, line_plot, regression_plot
 
 
 @pytest.fixture(autouse=True)
@@ -309,3 +311,84 @@ def test_line_plot_accepts_multiple_y_columns_without_series():
     assert list(beta_line.get_xdata()) == [2020, 2021]
     assert alpha_line.get_ydata().tolist() == [2.0, 6.0]
     assert beta_line.get_ydata().tolist() == [3.0, 7.0]
+
+
+@pytest.mark.parametrize("cmap", ["viridis", None, ListedColormap(["red", "green", "blue"])])
+def test_bar_plot_preserves_colormap_inputs_and_samples(cmap, tmp_path):
+    target = tmp_path / "bars.png"
+    bar_plot(
+        ["a", "b", "c"], [1, 2, 3], cmap=cmap,
+        gradient_start=0, gradient_end=1, sort_mode=None,
+        save_path=target, print_save_path=False, dpi=40,
+    )
+    palette = cmap if isinstance(cmap, ListedColormap) else matplotlib.colormaps[cmap or "viridis"]
+    bars = plt.gcf().axes[0].containers[0]
+    np.testing.assert_allclose([bar.get_facecolor() for bar in bars], palette([0, 0.5, 1]))
+    assert list(bars.datavalues) == [1, 2, 3]
+    assert target.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_grouped_bars_preserve_series_colors(tmp_path):
+    target = tmp_path / "grouped.png"
+    bar_plot(
+        ["a", "b"], [[1, 3], [2, 4]], cmap="Blues",
+        series_labels=["first", "second"], gradient_start=0.2, gradient_end=0.8,
+        sort_mode=None, save_path=target, print_save_path=False, dpi=40,
+    )
+    containers = plt.gcf().axes[0].containers
+    colors = matplotlib.colormaps["Blues"]([0.2, 0.8])
+    assert len(containers) == 2
+    for bars, color in zip(containers, colors):
+        np.testing.assert_allclose([bar.get_facecolor() for bar in bars], [color, color])
+    assert target.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+@pytest.mark.parametrize("gradient", [False, True])
+def test_line_plot_preserves_colormap_samples(gradient, tmp_path):
+    target = tmp_path / "lines.png"
+    df = pd.DataFrame({"x": [0, 1, 2], "y": [0, 1, 2]})
+    [(fig, ax)] = line_plot(
+        df, x="x", y="y", cmap_names=["viridis"], gradient=gradient,
+        gradient_start=0.2, gradient_end=0.8, gradient_mode="linear",
+        show=False, save_path=target, print_save_path=False, dpi=40,
+    )
+    fig.canvas.draw()
+    palette = matplotlib.colormaps["viridis"]
+    if gradient:
+        np.testing.assert_allclose(ax.collections[0].get_colors(), palette([0.2, 0.8]))
+    else:
+        np.testing.assert_allclose(ax.lines[0].get_color(), palette(0.6))
+        np.testing.assert_array_equal(ax.lines[0].get_ydata(), [0, 1, 2])
+    assert target.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_box_plot_preserves_colors_labels_and_summary(tmp_path):
+    target = tmp_path / "boxes.png"
+    result = box_plot(
+        {"first group": [1, 2, 3], "second group": [4, 5, 6]},
+        cmap="viridis", wrap_width=7, print_summary=False,
+        save_path=target, print_save_path=False, dpi=40,
+    )
+    ax = result["ax"]
+    expected = matplotlib.colormaps["viridis"]([0.25, 0.9])
+    expected[:, 3] = 0.9
+    np.testing.assert_allclose([box.get_facecolor() for box in ax.patches], expected)
+    assert [tick.get_text() for tick in ax.get_xticklabels()] == ["first\ngroup", "second\ngroup"]
+    np.testing.assert_array_equal(ax.get_xticks(), [1, 2])
+    assert result["summary"]["median"].tolist() == [2, 5]
+    assert target.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_regression_plot_preserves_binned_scatter_colors(tmp_path):
+    target = tmp_path / "regression.png"
+    xs = np.arange(24, dtype=float)
+    df = pd.DataFrame({"x": xs, "y": 0.5 * xs + np.sin(xs)})
+    regression_plot(
+        df, x="x", y="y", bins=4, cmap="viridis", print_summary=False,
+        latex_options=False, save_path=target, print_save_path=False, dpi=40,
+    )
+    scatter = plt.gcf().axes[0].collections[-1]
+    np.testing.assert_allclose(
+        scatter.get_facecolors(), matplotlib.colormaps["viridis"](np.linspace(0, 1, 4))
+    )
+    assert target.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")

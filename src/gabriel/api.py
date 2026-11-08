@@ -1248,8 +1248,12 @@ async def rank(
         Model name used for ranking calls. The signature default was current
         when this package version shipped; model IDs change, so verify the exact
         slug in the official OpenAI model catalog before overriding it.
-    n_rounds, matches_per_round, power_matching, learning_rate:
-        Parameters controlling the Elo-style tournament mechanics.
+    n_rounds, matches_per_round, power_matching:
+        Parameters controlling the tournament and pairing mechanics.
+    learning_rate:
+        Total smoothing mass per observed pair, split evenly between the
+        two outcomes. With zero smoothing, each component must have a
+        finite unregularized fit.
     n_parallels:
         Concurrency ceiling, not a fixed worker count. Keep the default unchanged:
         GABRIEL ramps up and adapts to rate limits and repeated errors. Temporary
@@ -1302,7 +1306,11 @@ async def rank(
     pandas.DataFrame
         Ranked outputs. The CSV written to ``save_dir`` always contains raw
         scores and standard errors, but the returned DataFrame hides those
-        columns unless ``return_raw_scores`` is ``True``.
+        columns unless ``return_raw_scores`` is ``True``. Raw scores are
+        centered within each connected comparison component. Comparisons
+        between components are unidentified. The z-score column retains
+        its pooled standardization. Items with no observed comparisons
+        have no estimated standard error.
     """
     save_dir = os.path.expandvars(os.path.expanduser(save_dir))
     os.makedirs(save_dir, exist_ok=True)

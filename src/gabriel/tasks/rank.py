@@ -52,6 +52,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Un
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize
+from scipy.sparse.csgraph import connected_components
+from scipy.special import expit
 
 # Import helper utilities from the gabriel package.  These modules are
 # expected to be available in the runtime environment.  Should you wish
@@ -136,8 +139,9 @@ class RankConfig:
         raw Bradley–Terry estimates (``"<attribute>_raw"``) and their
         standard errors (``"<attribute>_se"``).
     learning_rate:
-        Pseudo‑count used by the BT model to regularise the win/loss
-        matrix.  A larger value makes updates more conservative.
+        Total pseudo-count per observed pair, split equally between both
+        directions. Zero requests an unregularized fit, which requires
+        bidirectional reachability through wins in each comparison component.
     model:
         Name of the language model to call via ``get_all_responses``.
     n_parallels:
@@ -266,6 +270,8 @@ class Rank:
         expanded = Path(os.path.expandvars(os.path.expanduser(cfg.save_dir)))
         expanded.mkdir(parents=True, exist_ok=True)
         cfg.save_dir = str(expanded)
+        if not math.isfinite(cfg.learning_rate) or cfg.learning_rate < 0:
+            raise ValueError("learning_rate must be finite and non-negative")
         self.cfg = cfg
         self.template = resolve_template(
             template=template,
@@ -290,7 +296,7 @@ class Rank:
         self._CANDIDATE_NEIGHBORS = 20  # neighbourhood size for info gain pairing
         self._HIGH_SE_FRAC = 0.25  # fraction of high‑uncertainty items
         self._MAX_ITER = 1000  # maximum iterations for BT optimisation
-        self._TOL = 1e-6  # convergence tolerance for BT
+        self._TOL = 1e-6  # gradient tolerance for BT
         # A small ridge term stabilises the inversion of the Fisher information
         # matrix when computing standard errors.  The previous value (1e‑9)
         # occasionally led to extremely large uncertainties for items with
@@ -486,130 +492,107 @@ class Rank:
         tol: float,
         return_info: bool = False,
     ) -> Union[Dict[str, float], Tuple[Dict[str, float], np.ndarray, np.ndarray]]:
-        """Fit a Bradley–Terry model given pairwise outcomes.
+        """Fit log skills within observed comparison components.
 
-        Parameters
-        ----------
-        item_ids:
-            List of unique item identifiers.
-        outcomes:
-            List of tuples ``(winner, loser)`` representing outcomes of
-            pairwise matches.  Ties can be represented by including
-            both ``(a, b)`` and ``(b, a)`` in the list; each entry
-            contributes a single increment to the win matrix.
-        pseudo:
-            Pseudo count added to both win and total match counts.  Acts
-            as a smoothing prior.
-        max_iter, tol:
-            Control convergence of the iterative fixed‑point updates.
-        return_info:
-            If ``True`` return the intermediate matrices ``n_ij`` and
-            ``p_ij`` for downstream standard error computation.
-
-        Returns
-        -------
-        scores : dict
-            Mapping from item identifier to estimated log‑skill.
-        (scores, n_ij, p_ij) : tuple
-            When ``return_info`` is ``True``, also return the total
-            match counts and predicted win probabilities for each pair.
+        Each outcome contributes one win. Smoothing adds half of ``pseudo``
+        to each direction of an observed edge. The returned match counts
+        contain only observed comparisons, for uncertainty estimation.
         """
         n = len(item_ids)
         idx = {item: i for i, item in enumerate(item_ids)}
-        # win matrix; wins[i,j] counts how many times i beat j
         wins = np.zeros((n, n), dtype=float)
-        for w, l in outcomes:
-            if w in idx and l in idx:
-                wins[idx[w], idx[l]] += 1.0
-        # total matches between each pair
-        n_ij = wins + wins.T
-        # total wins for each item
-        w_i = wins.sum(axis=1)
-        # add pseudo counts
-        n_ij += pseudo
-        w_i += pseudo
-        # initialise skill parameters uniformly
-        p = np.ones(n, dtype=float)
-        for _ in range(max_iter):
-            # denominator for each player in the fixed point update
-            denom = (n_ij / (p[:, None] + p[None, :])).sum(axis=1)
-            p_new = w_i / denom
-            if np.max(np.abs(p_new - p)) < tol:
-                p = p_new
-                break
-            p = p_new
-        # convert to log space and centre at zero mean
-        s = np.log(p)
-        s -= s.mean()
+        for winner, loser in outcomes:
+            if winner != loser and winner in idx and loser in idx:
+                wins[idx[winner], idx[loser]] += 1
+
+        observed = wins + wins.T
+        scores = np.zeros(n, dtype=float)
+        count, labels = connected_components(observed, directed=False)
+        for label in range(count):
+            members = np.flatnonzero(labels == label)
+            if len(members) < 2:
+                continue
+            block = np.ix_(members, members)
+            local_wins = wins[block]
+            if pseudo == 0 and connected_components(
+                local_wins, directed=True, connection="strong", return_labels=False
+            ) != 1:
+                raise ValueError(
+                    "Unregularized Bradley–Terry scores are undefined for a "
+                    "separated comparison component. Use a positive learning_rate."
+                )
+
+            left, right = np.nonzero(np.triu(observed[block], k=1))
+            forward = local_wins[left, right] + pseudo / 2
+            reverse = local_wins[right, left] + pseudo / 2
+            if len(members) == 2:
+                contrast = np.log(forward[0]) - np.log(reverse[0])
+                scores[members] = [contrast / 2, -contrast / 2]
+                continue
+
+            def objective(free_scores: np.ndarray) -> Tuple[float, np.ndarray]:
+                # Fix one score at zero to remove the location indeterminacy.
+                local = np.append(free_scores, 0.0)
+                delta = local[left] - local[right]
+                loss = forward @ np.logaddexp(0, -delta) + reverse @ np.logaddexp(
+                    0, delta
+                )
+                residual = reverse * expit(delta) - forward * expit(-delta)
+                gradient = np.bincount(left, residual, minlength=len(local))
+                gradient -= np.bincount(right, residual, minlength=len(local))
+                return float(loss), gradient[:-1]
+
+            result = minimize(
+                objective,
+                np.zeros(len(members) - 1),
+                jac=True,
+                method="L-BFGS-B",
+                options={"maxiter": max_iter, "gtol": tol, "ftol": np.finfo(float).eps},
+            )
+            if not result.success:
+                raise RuntimeError(f"Bradley–Terry fit did not converge: {result.message}")
+            local = np.append(result.x, 0.0)
+            scores[members] = local - local.mean()
+
+        by_item = dict(zip(item_ids, scores.tolist()))
         if not return_info:
-            return {item: float(val) for item, val in zip(item_ids, s)}
-        # predicted win probabilities between each pair
-        exp_s = np.exp(s)
-        p_ij = exp_s[:, None] / (exp_s[:, None] + exp_s[None, :])
-        return {item: float(val) for item, val in zip(item_ids, s)}, n_ij, p_ij
+            return by_item
+        probabilities = expit(scores[:, None] - scores[None, :])
+        return by_item, observed, probabilities
 
     def _bt_standard_errors(
         self,
-        s: np.ndarray,
         n_ij: np.ndarray,
         p_ij: np.ndarray,
         ridge: float,
+        pseudo: float,
     ) -> np.ndarray:
-        """Estimate standard errors for BT skill parameters.
+        """Compute model-based uncertainty within observed components.
 
-        The observed Fisher information for the Bradley–Terry model is given by
-        ``I = diag(q 1) - q`` where ``q = n_ij * p_ij * (1 - p_ij)`` encodes the
-        uncertainty contributed by each pairwise comparison (Ford, 1957).  The
-        estimates satisfy a sum-to-zero constraint, so the Fisher information is
-        rank deficient with the all-ones vector in its null space.  Instead of
-        selecting an arbitrary reference item (which previously produced
-        inflated standard errors for that reference when it received few
-        comparisons), we project the matrix onto the constrained subspace and
-        take its Moore–Penrose pseudoinverse.  A small ridge term stabilises the
-        inversion for sparse comparison graphs.  The standard error for item ``i``
-        is the square root of the ``i``-th diagonal entry of the resulting
-        covariance matrix.
-
-        Parameters
-        ----------
-        s : np.ndarray
-            Array of estimated log-skills for each item.
-        n_ij : np.ndarray
-            Matrix of total match counts between items (wins + losses).
-        p_ij : np.ndarray
-            Matrix of predicted win probabilities between items.
-        ridge : float
-            Small constant added to the diagonal of the projected Fisher
-            information matrix for numerical stability.
-
-        Returns
-        -------
-        np.ndarray
-            Array of standard errors corresponding to each element of ``s``.
+        Pseudo-counts contribute curvature to the fit. Sampling variation
+        comes from observed comparisons, so use observed information in
+        the middle of the sandwich. Isolates have no standard error.
         """
+        errors = np.full(len(n_ij), np.nan)
+        count, labels = connected_components(n_ij, directed=False)
+        for label in range(count):
+            members = np.flatnonzero(labels == label)
+            if len(members) < 2:
+                continue
+            block = np.ix_(members, members)
+            counts = n_ij[block]
+            probabilities = p_ij[block]
+            variance = probabilities * probabilities.T
 
-        n = len(s)
-        if n == 0:
-            return np.array([], dtype=float)
-        if n == 1:
-            return np.zeros(1, dtype=float)
-
-        q_ij = n_ij * p_ij * (1 - p_ij)
-        diag = q_ij.sum(axis=1)
-        I = np.diag(diag) - q_ij
-        I = np.nan_to_num(I)
-        ones = np.ones((n, 1))
-        proj = np.eye(n) - ones @ ones.T / n
-        I_proj = proj @ I @ proj
-        I_proj[np.diag_indices(n)] += ridge
-        try:
-            cov = np.linalg.pinv(I_proj, rcond=1e-12)
-        except np.linalg.LinAlgError:
-            cov = np.linalg.pinv(np.nan_to_num(I_proj), rcond=1e-12)
-        cov = proj @ cov @ proj
-        cov = 0.5 * (cov + cov.T)
-        se = np.sqrt(np.clip(np.diag(cov), 0.0, None))
-        return np.nan_to_num(se)
+            observed = counts * variance
+            fitted = (counts + pseudo * (counts > 0)) * variance
+            meat = np.diag(observed.sum(axis=1)) - observed
+            bread = np.diag(fitted.sum(axis=1)) - fitted
+            projector = np.eye(len(members)) - 1.0 / len(members)
+            inverse = np.linalg.pinv(bread + ridge * projector, hermitian=True)
+            covariance = inverse @ meat @ inverse
+            errors[members] = np.sqrt(np.clip(np.diag(covariance), 0, None))
+        return errors
 
     def _fit_pl(
         self,
@@ -1097,17 +1080,17 @@ class Rank:
                 )
                 for i in item_ids:
                     ratings[i][attr] = bt_scores[i]
-                s_vec = np.array([bt_scores[i] for i in item_ids])
                 se_vec = self._bt_standard_errors(
-                    s=s_vec,
                     n_ij=n_ij,
                     p_ij=p_ij,
                     ridge=self._SE_RIDGE,
+                    pseudo=self.cfg.learning_rate,
                 )
                 for i, se_val in zip(item_ids, se_vec):
                     se_store[attr][i] = float(se_val)
-                    se_agg_next[i] += float(se_val)
-                    se_agg_counts[i] += 1
+                    if np.isfinite(se_val):
+                        se_agg_next[i] += float(se_val)
+                        se_agg_counts[i] += 1
             for i in item_ids:
                 if se_agg_counts[i] > 0:
                     se_agg_next[i] /= se_agg_counts[i]
@@ -1927,17 +1910,17 @@ class Rank:
                     )
                     for i in item_ids:
                         ratings[i][attr] = bt_scores[i]
-                    s_vec = np.array([bt_scores[i] for i in item_ids])
                     se_vec = self._bt_standard_errors(
-                        s=s_vec,
                         n_ij=n_ij,
                         p_ij=p_ij,
                         ridge=self._SE_RIDGE,
+                        pseudo=self.cfg.learning_rate,
                     )
                     for i, se_val in zip(item_ids, se_vec):
                         se_store[attr][i] = float(se_val)
-                        se_agg_next[i] += float(se_val)
-                        se_agg_counts[i] += 1
+                        if np.isfinite(se_val):
+                            se_agg_next[i] += float(se_val)
+                            se_agg_counts[i] += 1
                 for i in item_ids:
                     if se_agg_counts[i] > 0:
                         se_agg_next[i] /= se_agg_counts[i]
@@ -2183,17 +2166,17 @@ class Rank:
                 )
                 for i in item_ids:
                     ratings[i][attr] = bt_scores[i]
-                s_vec = np.array([bt_scores[i] for i in item_ids])
                 se_vec = self._bt_standard_errors(
-                    s=s_vec,
                     n_ij=n_ij,
                     p_ij=p_ij,
                     ridge=self._SE_RIDGE,
+                    pseudo=self.cfg.learning_rate,
                 )
                 for i, se_val in zip(item_ids, se_vec):
                     se_store[attr][i] = float(se_val)
-                    se_agg_next[i] += float(se_val)
-                    se_agg_counts[i] += 1
+                    if np.isfinite(se_val):
+                        se_agg_next[i] += float(se_val)
+                        se_agg_counts[i] += 1
             for i in item_ids:
                 if se_agg_counts[i] > 0:
                     se_agg_next[i] /= se_agg_counts[i]
